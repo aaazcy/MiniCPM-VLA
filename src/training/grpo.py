@@ -97,6 +97,8 @@ class GRPOTrainer:
     # ------------------------------------------------------------------ #
     # Update (GRPO loss)
     # ------------------------------------------------------------------ #
+    CHUNK = 4  # batch size for batched logp re-encoding (VRAM-bounded: bwd batch4 ~23G)
+
     def update(self, groups: List[List[Trajectory]], logger: Logger) -> Dict:
         """One GRPO update over rollout groups. `groups`: n_groups x group_size."""
         n_groups = len(groups)
@@ -107,19 +109,55 @@ class GRPOTrainer:
         A = grpo_advantage(R, g.group_size)                     # (n_groups, group_size)
         A = torch.from_numpy(A).float().to(self.device)
 
-        # ---- step 3: clipped policy loss + KL vs frozen SFT reference ----
-        # Recompute logp under current policy (trainable) and reference (frozen).
-        logp_pi, logp_ref, logp_old = [], [], []
-        for group in groups:
-            for traj in group:
-                lp_pi, lp_ref = self._traj_logps(traj)
-                logp_pi.append(lp_pi)
-                logp_ref.append(lp_ref)
-                logp_old.append(lp_pi.detach())
+        # ---- step 3: batched logp re-encoding ----
+        # policy and frozen reference are BOTH ~15-19GB; they cannot coexist on a
+        # 32GB card. Chunked two-phase: reference (no-grad) first, offloaded to CPU;
+        # then policy (grad) alone on the GPU.
+        trajs = [t for group in groups for t in group]
+        traj_sizes = [t.length for t in trajs]
+        steps = []  # (img, lang, act, audio) flattened
+        for traj in trajs:
+            audio = [traj.audio_wav] if traj.audio_wav is not None else None
+            for obs, act in zip(traj.obs, traj.actions):
+                img, lang = self._obs_to_tensor(obs)
+                steps.append((img, lang,
+                              torch.from_numpy(act).float().to(self.device), audio))
 
+        def _batch_logps(model, step_list, grad: bool) -> torch.Tensor:
+            out = []
+            ctx = torch.enable_grad() if grad else torch.no_grad()
+            with ctx:
+                for i in range(0, len(step_list), self.CHUNK):
+                    chunk = step_list[i:i + self.CHUNK]
+                    imgs = torch.cat([s[0] for s in chunk], dim=0)
+                    langs = [s[1] for s in chunk]
+                    acts = torch.stack([s[2] for s in chunk])
+                    audio = [s[3] for s in chunk] if any(s[3] is not None for s in chunk) \
+                        else None
+                    out.append(model.logp_actions(imgs, langs, acts, audio))
+            return torch.cat(out)
+
+        # phase A: reference logp (frozen, detached) — policy offloaded to CPU first
+        self.policy.to("cpu")
+        self.reference.to(self.device)
+        ref = _batch_logps(self.reference, steps, grad=False).detach()
+        self.reference.to("cpu")
+        torch.cuda.empty_cache()
+
+        # phase B: policy logp (grad) — alone on the GPU
+        self.policy.to(self.device)
+        pi = _batch_logps(self.policy, steps, grad=True)
+
+        # regroup into (n_groups, group_size) sums per trajectory
+        logp_pi, logp_ref, logp_old = [], [], []
+        start = 0
+        for size in traj_sizes:
+            logp_pi.append(pi[start:start + size].sum())
+            logp_ref.append(ref[start:start + size].sum())
+            start += size
         logp_pi = torch.stack(logp_pi).reshape(n_groups, g.group_size)
         logp_ref = torch.stack(logp_ref).reshape(n_groups, g.group_size)
-        logp_old = torch.stack(logp_old).reshape(n_groups, g.group_size)
+        logp_old = logp_pi.detach()
 
         ratio = torch.exp(logp_pi - logp_old)
         clipped = torch.clamp(ratio, 1 - g.clip_eps, 1 + g.clip_eps)
