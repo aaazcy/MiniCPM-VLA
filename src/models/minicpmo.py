@@ -25,6 +25,7 @@ import logging
 from typing import List, Optional
 
 import torch
+import numpy as np
 from torch import nn
 from peft import LoraConfig, get_peft_model
 
@@ -37,6 +38,7 @@ class MiniCPMoWrapper(nn.Module):
     def __init__(self, model_id: str, use_lora: bool = True, lora_r: int = 8,
                  lora_alpha: int = 16, lora_dropout: float = 0.0,
                  enable_audio: bool = False, audio_sample_rate: int = 16000,
+                 audio_only: bool = False,
                  hf_cache_dir: Optional[str] = None,
                  dtype: torch.dtype = torch.bfloat16):
         super().__init__()
@@ -45,6 +47,7 @@ class MiniCPMoWrapper(nn.Module):
         self.model_id = model_id
         self.enable_audio = enable_audio
         self.audio_sample_rate = audio_sample_rate
+        self.audio_only = audio_only
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True,
                                                        cache_dir=hf_cache_dir)
         self.base = AutoModel.from_pretrained(model_id, torch_dtype=dtype,
@@ -102,18 +105,66 @@ class MiniCPMoWrapper(nn.Module):
         imgs = [im.detach().cpu().float().numpy() for im in images]
         if imgs[0].max() <= 1.5:
             imgs = [(im * 255).astype("uint8") for im in imgs]
-        # MiniCPM-o's processor expects PIL images (numpy gets misread as a
-        # different aspect ratio and tiles into ~14 slices -> OOM)
         imgs = [Image.fromarray(im.transpose(1, 2, 0)) for im in imgs]
 
         audios = None
         if self.enable_audio and audio_wavs is not None and all(w is not None for w in audio_wavs):
-            audios = [w.detach().cpu().numpy().astype("float32") for w in audio_wavs]
+            def _to_wav(w):   # accepts torch.Tensor / np.ndarray / wrapped list
+                if isinstance(w, (list, tuple)) and len(w) == 1:
+                    w = w[0]
+                if hasattr(w, "detach"):
+                    w = w.detach().cpu().numpy()
+                return np.asarray(w, dtype="float32")
+            audios = [_to_wav(w) for w in audio_wavs]
+        if self.audio_only and audios is None:
+            raise RuntimeError("audio_only=True but no audio wavs provided (B3 speech-only "
+                               "input requires a wav for every sample)")
 
-        inputs = self.processor(text=list(lang_texts), images=imgs, audios=audios,
-                                sampling_rate=self.audio_sample_rate,
-                                max_slice_nums=1,   # 1 tile: ~1024 vision tokens
-                                return_tensors="pt").to(images.device)
+        # The processor requires explicit multimodal placeholders in the text.
+        # audio_only (B3): the instruction words are NOT in the text — speech is the
+        # ONLY language channel, so text carries just the placeholders.
+        if self.audio_only:
+            texts = [f"(<image>./</image>)\n(<audio>./</audio>)" for _ in lang_texts]
+        else:
+            texts = [f"(<image>./</image>)\n{t}" for t in lang_texts]
+            if audios is not None:
+                texts = [f"(<audio>./</audio>)\n{t}" for t in texts]
+
+        # The image processor treats a LIST of images as TILES of ONE sample, so
+        # batching must be done per-sample and merged manually.
+        per = []
+        for i in range(len(images)):
+            a = [audios[i]] if audios is not None else None
+            per.append(self.processor(text=[texts[i]], images=[imgs[i]], audios=a,
+                                      sampling_rate=self.audio_sample_rate,
+                                      max_slice_nums=1, return_tensors="pt"))
+
+        pad_id = getattr(self.processor.tokenizer, "pad_token_id", 0) or 0
+        max_len = max(p["input_ids"].shape[1] for p in per)
+        input_ids_list, masks, pixel_values, image_sizes, tgt_sizes, bounds = [], [], [], [], [], []
+        for p in per:
+            L = p["input_ids"].shape[1]
+            pad = max_len - L
+            input_ids_list.append(torch.cat([torch.full((1, pad), pad_id, dtype=torch.long),
+                                             p["input_ids"]], dim=1))
+            masks.append(torch.cat([torch.zeros((1, pad), dtype=torch.bool),
+                                    p["attention_mask"].bool()], dim=1))
+            pixel_values.extend(p["pixel_values"])          # each is a sample's tiles
+            image_sizes.extend(p["image_sizes"])
+            ts = p["tgt_sizes"]
+            tgt_sizes.append(ts[0] if isinstance(ts, list) else ts)  # (n, 2) tensor
+            b = p["image_bound"]
+            bounds.append((b[0] if isinstance(b, list) else b) + pad)  # (n,2) + pad offset
+
+        inputs = {
+            "input_ids": torch.cat(input_ids_list, dim=0).to(images.device),
+            "attention_mask": torch.cat(masks, dim=0).to(images.device),
+            "pixel_values": [[t.to(images.device) for t in s] if isinstance(s, (list, tuple))
+                             else s.to(images.device) for s in pixel_values],
+            "image_sizes": image_sizes,
+            "image_bound": [b.to(images.device) for b in bounds],
+            "tgt_sizes": torch.cat(tgt_sizes, dim=0).to(images.device),
+        }
         bs, seq_len = inputs["input_ids"].shape
         inputs["position_ids"] = torch.arange(seq_len, device=images.device) \
             .unsqueeze(0).expand(bs, -1)
@@ -156,14 +207,23 @@ class MiniCPMoWrapper(nn.Module):
         embeds = self.base.get_omni_embedding(
             inputs, input_embeddings=text_embeds,
             chunk_length=self.base.config.audio_chunk_length)
-        out = self.llm(
+        # Unwrap to the raw Qwen3Model: self.llm may be PeftModelForCausalLM
+        # (LoRA) -> Qwen3ForCausalLM -> Qwen3Model. Only Qwen3Model exposes
+        # last_hidden_state; the ForCausalLM wrapper's out[0] is LOGITS (B,T,vocab).
+        m = self.llm
+        while hasattr(m, "model") and type(m).__name__ != "Qwen3Model":
+            m = m.model
+        out = m(
             input_ids=None,
             position_ids=inputs["position_ids"].long(),
             inputs_embeds=embeds,
             attention_mask=inputs["attention_mask"],
-            output_hidden_states=True,
+            output_hidden_states=False,
         )
-        hs = out.hidden_states[-1]                       # (B, T, H)
+        hs = getattr(out, "last_hidden_state", None)
+        if hs is None:
+            hs = out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None \
+                else out[0]
         seq_lens = inputs["attention_mask"].sum(dim=1) - 1
         return hs[torch.arange(len(seq_lens)), seq_lens]
 

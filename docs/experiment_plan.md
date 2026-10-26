@@ -20,7 +20,28 @@ RL), and what does synchronized synthesized speech (B3) add?
 | B0 | MiniCPM-o 4.5 | frozen backbone + new head | SFT only | no-RL sanity |
 | B1 | MiniCPM-o 4.5 | frozen backbone + new head | SFT → GRPO | head-only RL |
 | B2 | MiniCPM-o 4.5 | LoRA(r=8,α=16) + new head | SFT → GRPO | **main experiment** |
-| B3 | MiniCPM-o 4.5 | = B2 + Whisper audio | SFT → GRPO | speech ablation (independent) |
+| B3 | MiniCPM-o 4.5 | = B2 + Whisper audio, **speech-only** | SFT → GRPO | speech ablation (independent) |
+
+> **B3 input modality (2026-10-27, revised):** B3 is AUDIO-ONLY — the text sequence
+> carries only `(<image>)(<audio>)` placeholders, NO instruction words. Speech is the
+> sole language channel. This makes B2 vs B3 a clean single-variable comparison
+> (vision constant; language via text vs via sound) for the robot voice-control goal.
+> TTS wavs are pre-synthesized from the instruction text (edge-tts/espeak-ng),
+> so no new data is required.
+>
+> **Cross-modal 2×2 eval matrix (added):** besides the native comparison, BOTH models
+> are tested on BOTH input channels on the same fixed instruction set (grpo_eval,
+> 16 instructions, all with wavs):
+>
+> | | text input | audio input |
+> |---|---|---|
+> | B2 model | in-distribution | zero-shot transfer |
+> | B3 model | zero-shot transfer | in-distribution |
+>
+> `scripts/evaluate.py --split csi --modality {native,audio,text}` implements the
+> matrix (audio = rebuild same weights with audio tower ON + speech-only; text =
+> audio tower OFF). Known caveat: 4/16 grpo_eval instruction TEXTS also appear in
+> training windows (different states); strict subset = remaining 12 (report both).
 
 ### 1.2 Comparisons (7 research questions)
 
@@ -33,7 +54,8 @@ RL), and what does synchronized synthesized speech (B3) add?
 4. A0 vs A1 — GRPO gain (OpenVLA-OFT)
 5. B0 vs B1 — GRPO gain (MiniCPM-o head-only)
 6. B1 vs B2 — LoRA backbone vs head-only (MiniCPM-o)
-7. B2 vs B3 — synchronized speech benefit (**B-family internal only, never vs A**)
+7. B2 vs B3 — text vs speech language channel (**B-family internal only, never vs A**)
+8. 2×2 cross-modal transfer — B2-on-audio & B3-on-text zero-shot (same 16-instr set)
 
 ### 1.3 Runs
 

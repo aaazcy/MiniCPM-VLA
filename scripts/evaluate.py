@@ -58,7 +58,11 @@ def load_instructions(manifest: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", required=True, choices=["a0", "a1", "b0", "b1", "b2", "b3"])
-    ap.add_argument("--split", choices=["id", "ood", "robustness"], required=True)
+    ap.add_argument("--split", choices=["id", "ood", "robustness", "csi"], required=True)
+    ap.add_argument("--modality", choices=["native", "audio", "text"], default="native",
+                    help="cross-modal 2x2 matrix: 'audio' = speech-only input, "
+                         "'text' = text-only input, 'native' = the group's own "
+                         "trained modality (B2->text, B3->speech)")
     ap.add_argument("--qualitative-failures", action="store_true",
                     help="collect 50 failed trajectories for failure labeling")
     ap.add_argument("--ckpt", default="auto", help="checkpoint dir | 'auto'")
@@ -66,6 +70,15 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.group)
+    # Cross-modal override: rebuild the SAME model with the other input channel.
+    # Base weights are identical across B groups, so B2-ckpt-on-audio and
+    # B3-ckpt-on-text are valid zero-shot transfer tests.
+    if args.modality == "audio":
+        cfg.group.audio = True
+        cfg.group.audio_only = True
+    elif args.modality == "text":
+        cfg.group.audio = False
+        cfg.group.audio_only = False
     torch.manual_seed(cfg.experiment.seed)
     logger = Logger(cfg, cfg.group.id, tags=["eval"])
 
@@ -96,6 +109,12 @@ def main():
         # official ABC->D protocol: same validation instructions rendered in env D
         instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
         scenes = ["calvin_scene_D"] * len(instrs)
+    elif args.split == "csi":
+        # cross-modal 2x2 matrix: grpo_eval windows (16 instructions, ALL have
+        # synthesized wavs) — the same fixed set is used for audio AND text
+        # evals so the two channels are directly comparable.
+        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_grpo_eval.json")
+        scenes = ["calvin_scene_A"] * len(instrs)
     else:
         # robustness: paraphrased / reordered / long instructions (same episodes, new text)
         rob_path = calvin_root / "splits" / "robust_instructions.json"
@@ -122,11 +141,13 @@ def main():
     metrics = evaluator.evaluate_subset(instrs, cfg.eval.seeds, cfg.eval.temperature,
                                         scenes=scenes, init_states=init_states)
     logger.log({f"eval/{args.split}/{k}": v for k, v in metrics.items()}, commit=True)
-    out = cfg.run_dir / f"eval_{args.split}.json"
+    out = cfg.run_dir / f"eval_{args.split}_{args.modality}.json"
     with open(out, "w") as f:
-        json.dump({"group": cfg.group.id, "split": args.split, "ckpt": str(ckpt),
+        json.dump({"group": cfg.group.id, "split": args.split,
+                   "modality": args.modality, "ckpt": str(ckpt),
                    "metrics": metrics}, f, indent=2)
-    print(f"[{cfg.group.id}/{args.split}] {json.dumps(metrics, indent=2)}\nSaved to {out}")
+    print(f"[{cfg.group.id}/{args.split}/{args.modality}] "
+          f"{json.dumps(metrics, indent=2)}\nSaved to {out}")
     logger.finish()
 
 

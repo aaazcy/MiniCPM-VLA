@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -69,14 +70,41 @@ def main():
     reference = build_model(cfg, stage="ref")
     if (ckpt / "action_head.pt").exists() or any((ckpt).glob("adapter*")):
         reference.load_adapter(str(ckpt))
-    reference.to(args.device)
+    # Reference stays on CPU: GRPOTrainer.update() does dual-phase offload
+    # (policy->cpu, reference->gpu, logp, reference->cpu, policy->gpu).
+    # Loading BOTH on a 32GB card OOMs (2x~19GB MiniCPM-o > 31.6GB).
     reference.eval()
 
     engine = make_engine(cfg, policy=policy, processor=policy.processor,
                          lora_path=str(ckpt), device=args.device)
 
     # 1. env + rollout (one trajectory)
-    sampler = _Sampler(["open the drawer"])  # dummy instruction; env ignores
+    # For audio groups (B3) the policy REQUIRES a wav (speech-only input): pick an
+    # instruction that has a pre-synthesized wav instead of the generic dummy.
+    dummy = "open the drawer"
+    if cfg.group.audio:
+        import hashlib
+        wav_dir = Path(cfg.dataset.csi_root) / "wav"
+        cand = None
+        for manifest in ["calvin_sft_train", "calvin_grpo_eval"]:
+            mpath = Path(cfg.dataset.calvin_root) / "splits" / f"{manifest}.json"
+            if not mpath.exists():
+                continue
+            import glob
+            for tid in json.load(open(mpath))["ids"]:
+                npz = glob.glob(f"{cfg.dataset.calvin_root}/*/{tid}.npz")
+                if not npz:
+                    continue
+                with np.load(npz[0], allow_pickle=True) as f:
+                    lang = str(f["lang"])
+                if (wav_dir / f"{hashlib.sha256(lang.encode()).hexdigest()[:16]}.wav").exists():
+                    cand = lang
+                    break
+            if cand:
+                break
+        dummy = cand or dummy
+        print(f"[B3 audio smoke] using instruction with wav: {dummy!r}")
+    sampler = _Sampler([dummy])  # dummy instruction; env ignores
     trainer = GRPOTrainer(policy, reference, cfg, engine, sampler, device=args.device)
 
     instr = "open the drawer"

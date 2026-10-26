@@ -148,6 +148,7 @@ class GroupCfg(BaseModel):
     sft_only: bool = False
     audio: bool = False
     audio_sample_rate: int = 16000
+    audio_only: bool = False   # speech is the ONLY language channel (no instruction text)
     dataset: List[Literal["calvin", "bridge", "csi"]]
     is_ablation: bool = False
     rollout_engine_override: Optional[Literal["vllm", "hf"]] = None

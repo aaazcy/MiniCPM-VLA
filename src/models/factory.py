@@ -35,6 +35,7 @@ def build_model(cfg: Config, stage: str = "sft",
         model = MiniCPMoWrapper(
             enable_audio=cfg.group.audio,
             audio_sample_rate=cfg.group.audio_sample_rate,
+            audio_only=cfg.group.audio_only,
             **kwargs,
         )
     else:

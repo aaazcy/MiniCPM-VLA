@@ -1,198 +1,99 @@
-# VLA vs Omni: controlled post-training comparison — OpenVLA-OFT-7B vs MiniCPM-o 4.5
+# MiniCPM-VLA
 
-> Dev tooling: harness-level auto-commit plugin + `/commit` semantic rewrite
-> (see `.opencode/` at the session root). [daemon check #1]
+将多模态语音大模型 **MiniCPM-o 4.5** 改造为机械臂操控策略(VLA):新接 7 维动作头,分两阶段后训练(**SFT 行为克隆 + GRPO 强化学习**),在 **CALVIN** 基准上完成 6 组对照实验(OpenVLA 基线 vs Omni 模型、语音 vs 文本输入消融),验证"**直接听语音指令操控机械臂**"。
 
-Controlled comparison of two paradigms for robot manipulation, focused on **post-training**
-(SFT warmstart + GRPO RL):
+> **当前版本:冒烟测试版(Smoke-Test Release)** — 18 项冒烟门禁全部通过,训练流程可一键开训,实验结果待产出。
 
-1. Baseline A: native pre-trained VLA — **OpenVLA-OFT-7B** (enhanced recipe) + SFT + GRPO
-2. Experimental B: general Omni foundation model — **MiniCPM-o 4.5 (9B)** + added action
-   head + SFT + GRPO
-3. Ablation B3: MiniCPM-o with synchronized **synthesized speech** (CSI), independent
-   ablation, never compared head-to-head vs A.
+## 核心特性
 
-The core question: can a general Omni vision-audio-language foundation model with an added
-action head match a native VLA on robot manipulation, and what does synchronized speech add?
+- **全模态 VLA 化**:图像 + 文本 + 语音(Whisper 音频塔)三通道输入 → 7 维连续动作输出([−1,1] 末端位姿 + 夹爪)
+- **两阶段后训练**:SFT(MSE 行为克隆)→ GRPO(组相对策略优化 + KL 约束)
+- **参数高效**:仅微调 LoRA 与动作头,32GB 单卡可训;策略/参考模型双阶段换卡
+- **严格对照**:6 组实验 + 语音/文本 2×2 交叉评测矩阵,数据泄漏防护(sha256 清单)
 
----
+## 技术方案
 
-## 1. Server profile & plan adjustments (checked on this machine)
+### 阶段一:SFT(监督微调)
 
-### Observed hardware (AutoDL container, GPU NOT mounted yet)
+损失 = MSE(预测动作, 演示动作);AdamW(动作头 lr 1e-4 / LoRA lr 2e-5);2 epochs,patience 1 早停;bf16 + 梯度检查点。
 
-| Resource | Value | Verdict |
-|---|---|---|
-| CPU | 2× Intel Xeon Platinum 8352V, 128 threads, AVX-512 | ✅ preprocessing trivial |
-| RAM | 1.0 TiB (934 GiB available) | ✅ far above the 64 GB requirement |
-| GPU | **none mounted** (`nvidia-smi` empty, `torch.cuda.is_available()=False`) | ⚠️ mount before Phase 1 (L40S 48 G recommended) |
-| CUDA toolkit | 12.4.131, driver SDK 550.120 | ✅ supports CUDA ≤ 12.4 |
-| Python | 3.12.3 (miniconda), torch 2.5.1+cu124 preinstalled | ✅ base env |
-| System disk | overlay 30 G, ~25 G free | ⚠️ keep envs/weights off it |
-| Data disk `/root/autodl-tmp` | **quota 50 G** (underlying 2×7.6 T NVMe RAID1) | ⚠️ see budget below |
-| Quirk | this Python's `struct.unpack` requires exactly-sized buffers | worked around in all parsers |
+### 阶段二:GRPO(强化学习后训练)
 
-### Key findings that shaped the plan
+策略在 CALVIN 环境 rollout → 组内相对优势 → 裁剪策略损失 + KL 惩罚 vs 冻结的 SFT 参考模型。
 
-1. **CALVIN is much bigger than the spec assumed.** The official `task_ABC_D.zip` is
-   **517 GB** (1.89 M step-level npz files). There is **no published "calvin_A-only" zip**.
-   Since this experiment only compares post-training, we do NOT download the full zip:
-   * `scene_info.npy` (a 525-byte official fix) maps step ranges per environment:
-     `A = [1191339, 1795044]`, `B = [0, 598909]`, `C = [598910, 1191338]`.
-   * We parse the zip's central directory over HTTP range requests
-     (`scripts/fetch_zip_index.py`), then selectively download only **~200–300 env-A
-     episodes** for SFT (~4–8 GB raw), env-A validation episodes for the ID test, and
-     env-D testing episodes for the OOD test (`scripts/selective_extract.py`).
-   * The 1.3 G `calvin_debug_dataset` (already downloaded) is used for pipeline smoke
-     tests only — it contains a single env-D episode per split, too small for training.
-2. **Baseline choice (per user decision): OpenVLA-OFT-7B only.** π0.5-3B was evaluated
-   and dropped: flow-matching head conflicts with the shared MSE/GRPO spec, requires
-   proprio, and 3B vs 9B size asymmetry. OFT keeps the same code path as the original
-   OpenVLA while using the improved training recipe.
-3. **Post-training data scale (per user decision).** No full-scale CALVIN/Bridge.
-   SFT data ≈ 200–300 env-A episodes (~45–90 k steps) + ≤5 k Bridge subsample.
-4. **B3 speech cannot use stock vLLM** (no Whisper-audio path for MiniCPM-o): B3 rolls
-   out with the HF engine; vision-only groups use vLLM. See `src/rollout/engine.py`.
-5. **Pinned versions** from the preinstalled env: torch 2.5.1+cu124 → vLLM `0.6.6.post1`.
-   The GRPO loop is custom (TRL cannot run CALVIN env rollouts).
-
-### Disk budget (50 G quota — sufficient with staged weights, no expansion required)
-
-| Item | Size |
+| 超参(全组锁定) | 值 |
 |---|---|
-| CALVIN env-A subset (raw → preprocessed 224px) | ~4–8 G |
-| Bridge V2 subsample (5 k trajs) | ~2 G |
-| CSI wavs (TTS, 16 kHz mono) | <0.5 G |
-| OpenVLA-OFT-7B weights (BF16, staged) | ~15 G |
-| MiniCPM-o 4.5 weights (BF16, staged) | ~19 G |
-| Checkpoints (LoRA + head only) | ~1 G |
-| conda env (torch + vLLM + deps) | ~12 G |
-| HF cache (staged, purged between phases) | 0 (purged) |
+| 组结构 / 裁剪 ε / KL β | 4 组 × 4 轨迹 / 0.2 / 0.05 |
+| 奖励 | R = R任务 + 0.5·R距离 + 1.0·R碰撞 + 0.1·R动作 |
+| 总步数 / 评估 | 20k 环境步 / 每 200 回合确定性评估(温度 0) |
+| 反向范围 | 仅 LoRA + 动作头 |
 
-Phase A peak ≈ 15 + 8 + 2 + 12 ≈ 37 G ✓ — Phase B peak ≈ 19 + 8 + 2 + 12 ≈ 41 G ✓
-(Expanding the disk is optional; if you do expand, both models can stay resident.)
+## 实验设计(6 组)
 
----
-
-## 2. Groups (strict control: same env, action space, reward, GRPO hyperparams, eval)
-
-| Group | Model | Backbone | Stage | Note |
+| 组 | 基座 | 可训参数 | 流程 | 输入 |
 |---|---|---|---|---|
-| A0 | OpenVLA-OFT-7B | LoRA LLM + native head | SFT only | no-RL sanity |
-| A1 | OpenVLA-OFT-7B | LoRA LLM + native head | SFT → GRPO | **main baseline** |
-| B0 | MiniCPM-o 4.5 | frozen, head only | SFT only | head-only sanity |
-| B1 | MiniCPM-o 4.5 | frozen, head only | SFT → GRPO | |
-| B2 | MiniCPM-o 4.5 | LoRA(r=8,α=16) + head | SFT → GRPO | **main experiment** |
-| B3 | MiniCPM-o 4.5 | = B2 + Whisper audio on | SFT → GRPO | CSI speech ablation — **never compared head-to-head vs A** |
+| A0 | OpenVLA-7B | LoRA + 原生动作头 | 仅 SFT | 图像+文本 |
+| A1 | OpenVLA-7B | 同上 | SFT→GRPO | 图像+文本 |
+| B0 | MiniCPM-o 4.5 | 仅动作头(骨干冻结) | 仅 SFT | 图像+文本 |
+| B1 | MiniCPM-o 4.5 | 仅动作头 | SFT→GRPO | 图像+文本 |
+| B2 ⭐ | MiniCPM-o 4.5 | LoRA(r=8,α=16)+动作头 | SFT→GRPO | 图像+文本 |
+| B3 | MiniCPM-o 4.5 | 同 B2 | SFT→GRPO | 图像+**语音-only** |
 
-Action space: 7-D continuous `[dx, dy, dz, rx, ry, rz, gripper]`, normalized [-1, 1].
-Action head (B groups, last-token hidden): `Linear(h,512) → LN → GELU → Linear(512,256) → LN → GELU → Linear(256,7) → Tanh`.
-OpenVLA uses its native discretized action head (trained with the same trainer code path).
+**8 个研究问题**:A1 vs B2(主线)、A0 vs B0、A1 vs B1、A0 vs A1、B0 vs B1、B1 vs B2、B2 vs B3(文字 vs 语音)、2×2 交叉迁移(B2 测语音 / B3 测文本,零样本)。
 
-### Data (post-training scale)
-- **SFT (A0,A1,B0,B1,B2):** ~200–300 env-A CALVIN episodes (85% train / 15% SFT-val,
-  early stop only, never in RL) + ≤5 k Bridge V2 subsample; images 224×224; heuristic
-  collision/failure filtering; identical data for every group.
-- **B3:** CSI — same CALVIN episodes, text → synthesized 16 kHz TTS wav, frame-aligned
-  (8-frame windows). *Synthesized, not human speech — limitation.*
-- **Tests (never seen in training):** ID = env-A validation episodes (held-out);
-  OOD = env-D episodes (cross-scene: new camera/texture/object layout); robustness =
-  official paraphrased instructions (`lang_paraphrase-MiniLM-L3-v2`). 20 seeds per episode.
+**评测**:ID / OOD 成功率(10 种子 × 20 回合,±std)+ 鲁棒性指令 + 50 条失败轨迹定性分析。
 
-### Pipeline (identical for every group)
-1. **SFT:** MSE(pred, demo); AdamW; LR head=1e-4, LoRA=2e-5; batch 8; wd 1e-4; grad ckpt;
-   early stop on SFT-val MSE plateau; best ckpt = GRPO start.
-2. **GRPO:** `group_size=4, rollout_per_group=4, clip_eps=0.2, beta_kl=0.05`;
-   LR head=1e-4, LoRA=2e-5; max_grad_norm=1.0; AdamW; group-relative advantage (no
-   critic); clipped policy loss + KL vs frozen SFT reference; backprop only LoRA + head;
-   deterministic eval (temp 0) every 200 episodes + checkpoint.
-3. **Reward:** `R = R_success + 0.5·R_dist + 1.0·R_collide + 0.1·R_action`
-   (success +10; dist = −L2 ee→target, progress proxy when unavailable; collide −2;
-   action = jitter penalty).
-
-### Metrics
-Full-task success (ID / OOD, primary), sample-efficiency steps to 50%/60%, mean return,
-mean steps, action smoothness, ee positional error, robustness degradation, failure-type
-pie chart, auxiliary VLM checks (target recall / instruction understanding).
-
----
-
-## 3. Project layout
-
-```
-vla-omni-bench/
-├── README.md  docs/limitations.md  requirements.txt
-├── configs/
-│   ├── base.yaml                  # shared locked hyperparameters
-│   ├── group/{a0,a1,b0,b1,b2,b3}.yaml
-│   └── eval.yaml
-├── scripts/
-│   ├── check_env.py               # GPU/CUDA/vLLM/disk sanity check
-│   ├── fetch_zip_index.py         # parse remote CALVIN zip central dir (HTTP ranges)
-│   ├── plan_calvin_subset.py      # pick env-A episodes from scene_info + metadata
-│   ├── selective_extract.py       # download chosen files from the 517G zip
-│   ├── download_data.sh           # debug dataset + pointers (no GPU needed)
-│   ├── preprocess_data.py         # raw steps -> 224px trajectory npz + splits (leak-guarded)
-│   ├── preprocess_csi_tts.py      # B3 synthesized 16kHz speech
-│   ├── train_sft.py / train_grpo.py / evaluate.py
-│   ├── run_group.sh               # sequential / multi-GPU runner
-│   ├── plot_results.py            # success curves + failure pie charts
-│   └── smoke_test.py              # CPU-only smoke tests
-└── src/
-    ├── config.py                  # pydantic config, locked & validated
-    ├── data/{splits,loader,csi}.py
-    ├── envs/calvin_env.py         # CALVIN wrapper (scene cfg A/D, 100-step episodes)
-    ├── models/{action_head,openvla,minicpmo,factory}.py
-    ├── rollout/engine.py          # vLLM / HF rollout abstraction
-    ├── training/{rewards,sft,grpo}.py
-    ├── eval/evaluator.py
-    └── utils/{logger,ckpt,instruction_sampler}.py
-```
-
-## 4. Quickstart
+## 快速开始
 
 ```bash
-# Phase 0 — CPU (current state)
-python scripts/check_env.py                     # reports "GPU missing" until you mount one
-bash scripts/download_data.sh                   # debug dataset + scene_info fix
-python scripts/fetch_zip_index.py --url http://calvin.cs.uni-freiburg.de/dataset/task_ABC_D.zip \
-    --out data/calvin/task_ABC_D.index.json     # ~230 MB, resumable (chunked fetch script included)
-python scripts/query_zip_index.py --index data/calvin/task_ABC_D.index.json \
-    --include 'task_ABC_D/training/ep_start_end_ids.npy' ... \
-    --out data/calvin/meta.index.json           # slim metadata index (streaming, 2GB-RAM-safe)
-python scripts/selective_extract.py --index data/calvin/meta.index.json --all \
-    --out-dir data/calvin/meta
-cp data/calvin/meta/training/scene_info.npy data/calvin/meta/task_ABC_D/training/
-python scripts/plan_calvin_subset.py --training-meta data/calvin/meta/task_ABC_D/training \
-    --validation-meta data/calvin/meta/task_ABC_D/validation --train-window-stride 12
-python scripts/query_zip_index.py --index data/calvin/task_ABC_D.index.json \
-    --episode-list data/calvin/plan.json --out data/calvin/steps.index.json
-python scripts/selective_extract.py --index data/calvin/steps.index.json --all \
-    --out-dir data/calvin/raw                     # ~8 GB, resumable
-python scripts/preprocess_data.py --dataset calvin --raw data/calvin/raw/task_ABC_D \
-    --lang-ann data/calvin/meta/task_ABC_D/training/lang_annotations/auto_lang_ann.npy
-python scripts/smoke_test.py
+# 1. 冒烟测试门禁(三卡并行)
+bash scripts/run_smokes.sh
 
-# Phase 1 — after mounting an L40S 48G
-python scripts/check_env.py                    # must pass before training
-bash scripts/run_group.sh                      # a0 a1 (Phase A) then b0..b3 (Phase B)
-python scripts/plot_results.py --outdir viz
+# 2. 单组冒烟
+python scripts/train_sft.py   --group b2 --smoke 5 --device cuda:1
+python scripts/smoke_grpo.py  --group b2 --device cuda:1
+
+# 3. 正式训练(三卡排程,GPU0: A0→A1 | GPU1: B2 | GPU2: B0→B1→B3)
+VLA_DEVICE=cuda:0 bash scripts/run_group.sh a0 a1
+VLA_DEVICE=cuda:1 bash scripts/run_group.sh b2
+VLA_DEVICE=cuda:2 bash scripts/run_group.sh b0 b1 b3
+
+# 4. 评测(主线 + 2×2 交叉矩阵)
+python scripts/evaluate.py --group b2 --split id
+python scripts/evaluate.py --group b2 --split csi --modality audio   # B2 零样本听语音
+python scripts/evaluate.py --group b3 --split csi --modality text    # B3 零样本读文本
 ```
 
-## 5. Reproducibility & experiment guards
+## 冒烟测试状态 ✅
 
-- All hyperparameters locked in `configs/*.yaml`, validated by pydantic; each run logs the
-  resolved config to wandb.
-- Split guard (`src/data/splits.py`): manifests carry sha256 hashes; loaders assert test
-  ids never appear in train/val.
-- Same reward code path, GRPO loop and evaluator for all groups — differences confined to
-  model/backbone/LoRA/audio flags in group configs.
-- B3 is tagged `is_ablation` in wandb and excluded from all head-to-head plotting.
-- All random seeds fixed; eval repeats 20× per episode.
+| 类别 | 状态 |
+|---|---|
+| 19 项 CPU 冒烟(配置/泄漏/奖励/数据) | ✅ |
+| A0/A1 SFT、A1 GRPO | ✅ |
+| B0/B1/B2/B3 模型验证(前向/反向/logp/生成,B3 含音频) | ✅ |
+| B0/B1/B2 SFT、B3 SFT(语音-only) | ✅ |
+| B1/B2 GRPO、B3 GRPO(语音 rollout) | ✅ |
 
-## 6. Limitations (full text in docs/limitations.md)
+## 项目结构
 
-Different vision backbones (ViT-L vs SigLip2), synthesized speech (B3), heuristic
-trajectory filtering, single static-camera view, sim2real gap, simulation stochasticity,
-env-A episode range from scene_info (verify in Phase 1), OFT HF id to verify, small-data
-post-training regime (results are about post-training comparison, not full-scale VLA SOTA).
+```
+configs/           # 训练超参(base.yaml 锁定)+ 6 组实验配置
+src/
+  models/          # OpenVLA / MiniCPM-o 包装 + 动作头
+  training/        # SFT / GRPO 训练器、奖励函数
+  envs/            # CALVIN 环境(headless)
+  rollout/         # HF 推理引擎
+  eval/            # 评测协议(ID/OOD/鲁棒/2×2 矩阵)
+scripts/           # 训练、冒烟、评测、数据预处理脚本
+docs/              # 实验方案、冒烟矩阵、数据管线、局限性
+```
+
+## 环境
+
+- torch 2.5.1+cu124,transformers,hf-mirror 镜像
+- 3×32G vGPU;HF 引擎(不依赖 vLLM)
+- CALVIN env-A 窗口 + Bridge V2(1995 段);B3 用 CSI(合成 TTS 语音)
+
+## 引用
+
+[MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o) · [OpenVLA](https://github.com/openvla/openvla) · [CALVIN](https://github.com/mees/calvin) · [GRPO (DeepSeekMath)](https://arxiv.org/abs/2402.03300)

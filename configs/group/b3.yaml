@@ -14,6 +14,17 @@ group:
   sft_only: false
   audio: true                     # enable Whisper audio encoder
   audio_sample_rate: 16000
+  audio_only: true                # speech is the ONLY language channel: the text
+                                  # sequence carries just (<image>/<audio>) placeholders,
+                                  # NO instruction words (single-variable vs B2)
   dataset: [csi]                  # CSI trajectories (CALVIN + TTS-aligned wav)
   is_ablation: true               # excluded from head-to-head comparison vs A
   rollout_engine_override: hf     # stock vLLM lacks MiniCPM-o audio path
+
+# B3 carries the audio tower + audio tokens on top of the 9B LLM: at the global
+# batch (2 traj x 2 steps = 4 samples/forward) SFT peaks at ~32.3G of 31.6G.
+# Shrink the effective step batch to 1 sample/forward for VRAM margin
+# (B3's CSI set is tiny, ~91 windows, so throughput impact is negligible).
+sft:
+  batch_size: 1
+  steps_per_traj: 1

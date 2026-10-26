@@ -45,6 +45,10 @@ class GRPOTrainer:
         self.device = device
         self.policy.to(device)
 
+        # B3 (audio) forward is heavier per sample (audio tower + audio tokens in
+        # the LLM sequence); halve the per-chunk batch for VRAM margin.
+        self.CHUNK = 2 if cfg.group.audio else self.CHUNK
+
         from .sft import make_optimizer
         self.opt = make_optimizer(policy, cfg.grpo.lr_action_head, cfg.grpo.lr_lora,
                                   weight_decay=cfg.sft.weight_decay)
@@ -117,7 +121,7 @@ class GRPOTrainer:
         traj_sizes = [t.length for t in trajs]
         steps = []  # (img, lang, act, audio) flattened
         for traj in trajs:
-            audio = [traj.audio_wav] if traj.audio_wav is not None else None
+            audio = traj.audio_wav          # raw wav (np.ndarray) or None
             for obs, act in zip(traj.obs, traj.actions):
                 img, lang = self._obs_to_tensor(obs)
                 steps.append((img, lang,
@@ -139,39 +143,53 @@ class GRPOTrainer:
 
         # phase A: reference logp (frozen, detached) — policy offloaded to CPU first
         self.policy.to("cpu")
+        torch.cuda.empty_cache()
+        log.info("[update] after policy->cpu: %.2f GB", torch.cuda.memory_allocated() / 1e9)
         self.reference.to(self.device)
+        log.info("[update] after reference->gpu: %.2f GB", torch.cuda.memory_allocated() / 1e9)
         ref = _batch_logps(self.reference, steps, grad=False).detach()
         self.reference.to("cpu")
         torch.cuda.empty_cache()
+        log.info("[update] after reference->cpu: %.2f GB", torch.cuda.memory_allocated() / 1e9)
 
-        # phase B: policy logp (grad) — alone on the GPU
+        # phase B: policy logp (grad) — per-chunk IMMEDIATE backward so the
+        # autograd graph of each chunk is freed (240 steps x graphs otherwise
+        # accumulates and OOMs the 32GB card).
         self.policy.to(self.device)
-        pi = _batch_logps(self.policy, steps, grad=True)
-
-        # regroup into (n_groups, group_size) sums per trajectory
-        logp_pi, logp_ref, logp_old = [], [], []
-        start = 0
-        for size in traj_sizes:
-            logp_pi.append(pi[start:start + size].sum())
-            logp_ref.append(ref[start:start + size].sum())
-            start += size
-        logp_pi = torch.stack(logp_pi).reshape(n_groups, g.group_size)
-        logp_ref = torch.stack(logp_ref).reshape(n_groups, g.group_size)
-        logp_old = logp_pi.detach()
-
-        ratio = torch.exp(logp_pi - logp_old)
-        clipped = torch.clamp(ratio, 1 - g.clip_eps, 1 + g.clip_eps)
-        policy_loss = -torch.min(ratio * A, clipped * A).mean()
-        kl = (logp_ref - logp_pi).mean()          # KL(policy || ref) approximation
-        loss = policy_loss + g.beta_kl * kl
-
         self.opt.zero_grad(set_to_none=True)
-        loss.backward()
+        a_flat = []
+        for gi in range(n_groups):
+            for tj in range(g.group_size):
+                a_flat.extend([A[gi, tj].item()] * traj_sizes[gi * g.group_size + tj])
+        a_flat = torch.tensor(a_flat, device=self.device, dtype=torch.float32)
+
+        pi_sum = 0.0
+        n_steps = 0
+        total_loss = 0.0
+        for i in range(0, len(steps), self.CHUNK):
+            chunk = steps[i:i + self.CHUNK]
+            imgs = torch.cat([s[0] for s in chunk], dim=0)
+            langs = [s[1] for s in chunk]
+            acts = torch.stack([s[2] for s in chunk])
+            audio = [s[3] for s in chunk] if any(s[3] is not None for s in chunk) else None
+            pi = self.policy.logp_actions(imgs, langs, acts, audio)   # (C,)
+            a = a_flat[i:i + self.CHUNK]
+            r = ref[i:i + self.CHUNK]
+            # single-pass approximation: importance ratio = 1 (logp_old = pi)
+            loss = -(a * pi).mean() + g.beta_kl * (r - pi).mean()
+            loss.backward()          # graph freed immediately
+            pi_sum += float(pi.detach().sum())
+            total_loss += float(loss) * len(chunk)
+            n_steps += len(chunk)
+
         torch.nn.utils.clip_grad_norm_(self.policy.trainable_parameters(), g.max_grad_norm)
         self.opt.step()
 
-        stats = {"grpo/loss": float(loss), "grpo/policy_loss": float(policy_loss),
-                 "grpo/kl": float(kl), "grpo/mean_reward": float(R.mean()),
+        kl = float(ref.mean() - pi_sum / max(n_steps, 1))
+        stats = {"grpo/loss": total_loss / max(n_steps, 1),
+                 "grpo/policy_loss": total_loss / max(n_steps, 1) - g.beta_kl * kl,
+                 "grpo/kl": kl,
+                 "grpo/mean_reward": float(R.mean()),
                  "grpo/success_rate": float(np.mean([t.success for grp in groups for t in grp]))}
         logger.log({**stats, "grpo/update": self.update_count}, step=self.env_steps)
         self.update_count += 1
