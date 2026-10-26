@@ -28,13 +28,26 @@ class CalvinEnv:
                  cameras: List[str] = None, image_size: int = 224, seed: Optional[int] = None,
                  calvin_root: Optional[Path] = None, scene: str = "calvin_scene_A"):
         from calvin_env.envs.play_table_env import get_env  # lazy import (needs pybullet)
+        import pybullet as p
+
+        # vGPU: eglRenderer PLUGIN fails to load ("failed to EGL with glad"), but
+        # ER_BULLET_HARDWARE_OPENGL still renders (verified: 64x64 image returned).
+        # Force it for ALL camera calls inside calvin_env.
+        _orig_get_camera_image = p.getCameraImage
+
+        def _patched_get_camera_image(*args, **kwargs):
+            kwargs["renderer"] = p.ER_BULLET_HARDWARE_OPENGL
+            kwargs.setdefault("flags", p.ER_NO_SEGMENTATION_MASK)
+            return _orig_get_camera_image(*args, **kwargs)
+
+        p.getCameraImage = _patched_get_camera_image
 
         cameras = cameras or ["rgb_static"]
         # dataset dir is required by calvin_env for state/animation loading
         dataset_dir = Path(calvin_root) if calvin_root is not None else Path("calvin")
         env = get_env(
             dataset_dir,
-            show_ui=False,
+            show_gui=False,   # NOTE: parameter is show_gui (was typo'd show_ui -> GUI mode -> X server)
             obs_space={"rgb_obs": cameras, "depth_obs": [], "state_obs": ["robot_obs"],
                        "language": True},
             scene=scene,   # calvin_scene_A (train/ID) or calvin_scene_D (OOD)
@@ -58,7 +71,7 @@ class CalvinEnv:
         robot_obs/scene_obs: optional recorded initial state (official CALVIN eval
         protocol resets each episode from its recorded start state).
         """
-        obs = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs, seed=self.seed)
+        obs = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
         self._instruction = instruction
         self._lang_annotation = self.env.get_lang_ann() if hasattr(self.env, "get_lang_ann") else None
         self._steps = 0
@@ -74,6 +87,9 @@ class CalvinEnv:
         i.e. exactly our [-1,1] action space. No denormalization needed.
         """
         act = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        # CALVIN expects a BINARY gripper action (-1 close / +1 open); the policy
+        # head outputs continuous values -> threshold at 0.
+        act[6] = 1.0 if act[6] >= 0.0 else -1.0
         obs, _, _, info = self.env.step(act)
         self._steps += 1
         done = bool(info.get("success", False)) or self._steps >= self.max_episode_steps
@@ -91,7 +107,17 @@ class CalvinEnv:
 
     # ------------------------------------------------------------------ #
     def _process_obs(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        img = obs["rgb_obs"][self.cameras[0]]  # (H, W, 3) uint8
+        img = np.asarray(obs["rgb_obs"][self.cameras[0]])
+        # pybullet on this vGPU returns effective pixels as int64 (and occasionally a
+        # 1x1 placeholder); normalize dtype and re-render through the camera object
+        # if the frame is degenerate.
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        if img.shape[0] <= 1 or img.shape[1] <= 1:
+            rgb_obs, _ = self.env.get_camera_obs()
+            img = np.asarray(rgb_obs[self.cameras[0]])
+            if img.dtype != np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
         if img.shape[0] != self.image_size:
             from PIL import Image
             img = np.asarray(Image.fromarray(img).resize((self.image_size, self.image_size)))
