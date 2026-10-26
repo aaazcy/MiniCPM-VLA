@@ -21,10 +21,10 @@ from src.config import load_config  # noqa: E402
 from src.models.factory import build_model  # noqa: E402
 
 
-def report(name: str):
-    peak = torch.cuda.max_memory_allocated() / 1e9
+def report(name: str, device: str = "cuda"):
+    peak = torch.cuda.max_memory_allocated(device=device) / 1e9
     print(f"  [{name}] peak VRAM: {peak:.2f} GB")
-    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_peak_memory_stats(device=device)
     torch.cuda.empty_cache()
 
 
