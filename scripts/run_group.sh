@@ -20,7 +20,8 @@ export TOKENIZERS_PARALLELISM=false
 # (After killing/ending a training process the vGPU can take a while to free
 # memory; launching immediately would OOM — this bit A0 once.)
 wait_gpu_free() {
-  local gpu_id="${CUDA_VISIBLE_DEVICES:-0}"
+  local gpu_id="${VLA_DEVICE##*:}"
+  case "$gpu_id" in cuda|"") gpu_id=0 ;; esac
   local mem
   mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu_id" | head -1)
   while [ "${mem:-0}" -gt 2000 ]; do
@@ -56,10 +57,22 @@ for g in ${1:-} ${2:-} ${3:-} ${4:-} ${5:-} ${6:-}; do
     *) echo "unknown group $g"; exit 1 ;;
   esac
 
-  # evaluation (ID / OOD / robustness) after training completes
-  for split in id ood robustness; do
-    python "$ROOT/scripts/evaluate.py" --group "$g" --split "$split" --device "$DEV" || true
-  done
+  # evaluation after training completes
+  case "$g" in
+    b3)  # speech-only model: no wavs for id/ood/robustness -> CSI matrix only
+      python "$ROOT/scripts/evaluate.py" --group b3 --split csi --modality audio --device "$DEV" || true
+      python "$ROOT/scripts/evaluate.py" --group b3 --split csi --modality text  --device "$DEV" || true ;;
+    b2)  # main experiment: standard splits + cross-modal matrix (speech zero-shot)
+      for split in id ood robustness; do
+        python "$ROOT/scripts/evaluate.py" --group "$g" --split "$split" --device "$DEV" || true
+      done
+      python "$ROOT/scripts/evaluate.py" --group b2 --split csi --modality text  --device "$DEV" || true
+      python "$ROOT/scripts/evaluate.py" --group b2 --split csi --modality audio --device "$DEV" || true ;;
+    *)
+      for split in id ood robustness; do
+        python "$ROOT/scripts/evaluate.py" --group "$g" --split "$split" --device "$DEV" || true
+      done ;;
+  esac
 done
 
 echo "All groups finished. Plotting:"
