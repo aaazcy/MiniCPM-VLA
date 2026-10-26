@@ -1,7 +1,7 @@
 # Experiment Plan — VLA vs Omni post-training comparison
 
-> Status: Phase 0 in progress (CPU-only data prep) · GPU not yet mounted
-> Last updated: 2026-10-26
+> Status: **smoke-gate phase**(冒烟门禁,3×32G vGPU 已挂载,数据/模型全就绪)
+> Last updated: 2026-10-27
 
 ## 0. One-line goal
 
@@ -101,55 +101,46 @@ mounting the GPU (the limit is expected to follow the instance spec).
 
 ## 4. Execution phases
 
-### Phase 0 — CPU now (in progress)
-- [x] Full codebase: configs, SFT/GRPO trainers, rollouts (vLLM+HF), evaluator, plotting
+### Phase 0 — 数据与代码(✅ 全部完成)
+- [x] Full codebase: configs, SFT/GRPO trainers, rollouts (HF engine), evaluator, plotting
 - [x] 19 CPU smoke checks green; pydantic-locked hyperparameters; leak-guarded splits
-- [x] scene_info fix (env-A mapping) downloaded; debug dataset downloaded
-- [x] zip central directory (229 MB) parsed → 1.89M-entry index (JSON on disk)
-- [x] Metadata extracted (ep_start_end_ids, lang_annotations, paraphrase; 8 files)
-- [x] Window-level plan: 127 env-A windows / 7,720 steps (~2.0 GB) + 34 val windows
-- [x] Downloaded 11,046 step files (~3.3 GB)
-- [x] CALVIN preprocessed: 107 train / 20 SFT-val / 34 id_test segments (708 MB)
-- [x] Robustness set: 34 paraphrased instructions (official lang_paraphrase)
-- [x] B3 TTS: 107/107 synthesized 16 kHz wavs (edge-tts)
-- [x] Bridge V2: 1,995 episodes via hf-mirror
-- [x] grpo_eval split: 16 windows held out from sft_train (leak-free GRPO eval)
-- [x] OpenVLA-7B GPU-verified (load 15.1G / SFT bwd batch4 23.1G / generate 15.4G)
-- [x] A0 SFT smoke + full training started (paused for disk expansion, ~step 250)
-- [~] MiniCPM-o-4_5 download (18/20 GB, RESUMABLE via snapshot_download)
+- [x] CALVIN env-A 窗口抽取与预处理:91 sft_train + 16 grpo_eval + 20 sft_val + 34 id_test
+- [x] Bridge V2 1,995 段;CSI 语音 107 条;鲁棒指令 34 条
+- [x] 模型本地化:OpenVLA-7B(15G)+ MiniCPM-o-4_5(19G)
+- [x] Git 基建:独立仓库 + 自动提交守护进程 + `/commit` 命令 + commit-writer agent + skill
 
-### PAUSED — user expanding data disk (resume steps below)
-```bash
-# 1. resume MiniCPM-o download (auto-resumes from .incomplete)
-python -c "from huggingface_hub import snapshot_download; snapshot_download('openbmb/MiniCPM-o-4_5', local_dir='/root/autodl-tmp/models/MiniCPM-o-4_5', max_workers=2)"
-# 2. verify B wrapper on GPU1 (incl. B3 audio path + VRAM baseline)
-python scripts/verify_models.py --group b2 --batch 2
-# 3. relaunch training
-CUDA_VISIBLE_DEVICES=0 nohup bash scripts/run_group.sh a0 > runs/log_a.log 2>&1 &
-CUDA_VISIBLE_DEVICES=1 nohup bash scripts/run_group.sh b0 b1 b2 b3 > runs/log_b.log 2>&1 &
+### Phase 1 — GPU 验证(✅ 大部分完成)
+- [x] 挂卡(3×32G vGPU)后 check_env 全绿
+- [x] OpenVLA-7B 验证:加载 15.1G、SFT bwd batch4 23.1G、生成 15.4G
+- [x] MiniCPM-o-4_5 验证(B0/B2 通过):PIL 修复(1-tile 1024 tokens)+ sdpa + gc + batch1
+- [x] CALVIN env 渲染链路:show_gui 修正 + 软渲染回退 + int64/占位图防御
+- [~] 冒烟门禁(见 docs/smoke_tests.md):A0/A1 SFT ✅、B0/B2 模型 ✅,其余进行中
+
+### Phase 2 — 统一开训(冒烟全过后启动)
 ```
+GPU0: A0(SFT) → A1(SFT→GRPO) → eval
+GPU1: B2(SFT→GRPO) → eval                # 主实验,最早出结果
+GPU2: B0(SFT) → B1(SFT→GRPO) → B3(SFT→GRPO 音频) → eval
+```
+- 启动:`VLA_DEVICE=cuda:N bash scripts/run_group.sh <groups>`
+- 参数:SFT 2 epoch / patience 1;batch 2×2(A)/1×1(B);GRPO 20k 步;eval 10 seed × 20 窗口
+- 预估:主对比 A1 vs B2 ≈ 8-10h;全部 6 组 ≈ 12-16h
 
-### Phase 1 — after GPU mount (L40S 48 G recommended)
-- [ ] Mount GPU → `check_env.py` green (torch 2.5.1+cu124, BF16)
-- [ ] `pip install vllm==0.6.6.post1` (+ calvin_env, openvla packages)
-- [ ] Verify weights: `openvla/openvla-7b-oft` (fallback openvla-7b) — Phase A
-- [ ] MiniCPM-o 4.5 checkpoint id/loc — Phase B (adapt `encode()` to real forward path)
-- [ ] Train A0 → A1 (SFT → GRPO), eval id/ood/robustness
-- [ ] Train B0 → B1 → B2 → B3, eval all splits
-- [ ] Qualitative failure labeling (50 trajs/group) + auxiliary VLM checks
-- [ ] plot_results (B3 excluded from A-vs-B charts)
+### Phase 3 — 评估与分析
+- [ ] 每组 ID/OOD/鲁棒评估(mean±std)+ 失败轨迹分类 + 绘图
+- [ ] 7 个对比结论 + 论文图表
 
 ## 5. Risks & mitigations (tracked in docs/limitations.md)
 
 | Risk | Mitigation |
 |---|---|
-| OFT HF id not published | fallback `openvla/openvla-7b`, same code path |
-| MiniCPM-o 4.5 weights not public | generic wrapper + verified fallback `MiniCPM-o-2_6`; replace id when available |
-| MiniCPM-o forward signature differs | Phase-1 TODO in `src/models/minicpmo.py` |
-| Freiburg server unstable | 16 MB chunked downloader with retry + resume; index cached |
-| env-A range from scene_info unverified | render 3 sampled episodes in `calvin_scene_A` before training |
-| HF download slow | `HF_ENDPOINT=https://hf-mirror.com` |
-| vLLM/cu124 mismatch | pin `vllm==0.6.6.post1`; HF engine fallback for all groups |
+| OFT HF id not published | 已回退 `openvla/openvla-7b`(本地快照) |
+| MiniCPM-o 4.5 weights not public | 已确认存在并本地化(openbmb/MiniCPM-o-4_5) |
+| MiniCPM-o forward signature differs | 已按真实源码适配(get_vllm_embedding/get_omni_embedding 路径) |
+| vGPU 无 EGL | 软渲染回退 + 图像防御转换(见 smoke_tests.md 坑记录) |
+| 32G 卡 9B 压线 | 1-tile + sdpa + gc + batch 1 已通过 |
+| GRPO 20k 步趋势弱 | 先跑主对比;不足则 A1/B2 单独加预算 |
+| 容器 bash 数组损坏 | 全部脚本用位置参数,禁用数组/("$@") |
 
 ## 6. Success criteria
 

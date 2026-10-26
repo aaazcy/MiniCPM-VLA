@@ -1,5 +1,8 @@
 # VLA vs Omni: controlled post-training comparison — OpenVLA-OFT-7B vs MiniCPM-o 4.5
 
+> Dev tooling: harness-level auto-commit plugin + `/commit` semantic rewrite
+> (see `.opencode/` at the session root). [daemon check #1]
+
 Controlled comparison of two paradigms for robot manipulation, focused on **post-training**
 (SFT warmstart + GRPO RL):
 
