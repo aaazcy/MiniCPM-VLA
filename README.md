@@ -1,99 +1,99 @@
 # MiniCPM-VLA
 
-将多模态语音大模型 **MiniCPM-o 4.5** 改造为机械臂操控策略(VLA):新接 7 维动作头,分两阶段后训练(**SFT 行为克隆 + GRPO 强化学习**),在 **CALVIN** 基准上完成 6 组对照实验(OpenVLA 基线 vs Omni 模型、语音 vs 文本输入消融),验证"**直接听语音指令操控机械臂**"。
+Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipulation policy (VLA): attach a 7-DoF action head, run two-stage post-training (**SFT behavior cloning + GRPO reinforcement learning**), and evaluate on the **CALVIN** benchmark with 6 controlled groups (OpenVLA baseline vs. Omni model; speech vs. text input ablation) to verify **"directly controlling a robot arm from spoken instructions"**.
 
-> **当前版本:冒烟测试版(Smoke-Test Release)** — 18 项冒烟门禁全部通过,训练流程可一键开训,实验结果待产出。
+> **Current release: Smoke-Test Release** — all 18 smoke-gate checks pass; training pipelines are launch-ready; experimental results pending.
 
-## 核心特性
+## Highlights
 
-- **全模态 VLA 化**:图像 + 文本 + 语音(Whisper 音频塔)三通道输入 → 7 维连续动作输出([−1,1] 末端位姿 + 夹爪)
-- **两阶段后训练**:SFT(MSE 行为克隆)→ GRPO(组相对策略优化 + KL 约束)
-- **参数高效**:仅微调 LoRA 与动作头,32GB 单卡可训;策略/参考模型双阶段换卡
-- **严格对照**:6 组实验 + 语音/文本 2×2 交叉评测矩阵,数据泄漏防护(sha256 清单)
+- **Omnimodal VLA**: image + text + speech (Whisper audio tower) inputs → 7-DoF continuous action output (end-effector pose + gripper, [−1,1])
+- **Two-stage post-training**: SFT (MSE behavior cloning) → GRPO (group-relative policy optimization with KL constraint)
+- **Parameter-efficient**: only LoRA adapters and the action head are trained — fits a single 32 GB GPU; policy/reference models swapped via dual-phase offload
+- **Rigorous comparisons**: 6 experiment groups + a 2×2 cross-modal speech/text evaluation matrix; leak-guarded splits (sha256 manifests)
 
-## 技术方案
+## Method
 
-### 阶段一:SFT(监督微调)
+### Stage 1: SFT (Supervised Fine-Tuning)
 
-损失 = MSE(预测动作, 演示动作);AdamW(动作头 lr 1e-4 / LoRA lr 2e-5);2 epochs,patience 1 早停;bf16 + 梯度检查点。
+Loss = MSE(predicted action, demonstrated action). AdamW (action head lr 1e-4 / LoRA lr 2e-5); 2 epochs with patience-1 early stopping; bf16 with gradient checkpointing.
 
-### 阶段二:GRPO(强化学习后训练)
+### Stage 2: GRPO (Reinforcement-Learning Post-Training)
 
-策略在 CALVIN 环境 rollout → 组内相对优势 → 裁剪策略损失 + KL 惩罚 vs 冻结的 SFT 参考模型。
+Roll out the policy in CALVIN → group-relative advantages → clipped policy loss + KL penalty against the frozen SFT reference model.
 
-| 超参(全组锁定) | 值 |
+| Hyperparameter (locked across all groups) | Value |
 |---|---|
-| 组结构 / 裁剪 ε / KL β | 4 组 × 4 轨迹 / 0.2 / 0.05 |
-| 奖励 | R = R任务 + 0.5·R距离 + 1.0·R碰撞 + 0.1·R动作 |
-| 总步数 / 评估 | 20k 环境步 / 每 200 回合确定性评估(温度 0) |
-| 反向范围 | 仅 LoRA + 动作头 |
+| Group structure / clip ε / KL β | 4 groups × 4 trajectories / 0.2 / 0.05 |
+| Reward | R = R<sub>success</sub> + 0.5·R<sub>dist</sub> + 1.0·R<sub>collision</sub> + 0.1·R<sub>action</sub> |
+| Total steps / evaluation | 20k env steps / deterministic eval every 200 episodes |
+| Backprop scope | LoRA + action head only |
 
-## 实验设计(6 组)
+## Experiment Design (6 Groups)
 
-| 组 | 基座 | 可训参数 | 流程 | 输入 |
+| Group | Backbone | Trainable | Pipeline | Input |
 |---|---|---|---|---|
-| A0 | OpenVLA-7B | LoRA + 原生动作头 | 仅 SFT | 图像+文本 |
-| A1 | OpenVLA-7B | 同上 | SFT→GRPO | 图像+文本 |
-| B0 | MiniCPM-o 4.5 | 仅动作头(骨干冻结) | 仅 SFT | 图像+文本 |
-| B1 | MiniCPM-o 4.5 | 仅动作头 | SFT→GRPO | 图像+文本 |
-| B2 ⭐ | MiniCPM-o 4.5 | LoRA(r=8,α=16)+动作头 | SFT→GRPO | 图像+文本 |
-| B3 | MiniCPM-o 4.5 | 同 B2 | SFT→GRPO | 图像+**语音-only** |
+| A0 | OpenVLA-7B | LoRA + native action head | SFT only | image + text |
+| A1 | OpenVLA-7B | same | SFT → GRPO | image + text |
+| B0 | MiniCPM-o 4.5 | action head only (frozen backbone) | SFT only | image + text |
+| B1 | MiniCPM-o 4.5 | action head only | SFT → GRPO | image + text |
+| B2 ⭐ | MiniCPM-o 4.5 | LoRA (r=8, α=16) + action head | SFT → GRPO | image + text |
+| B3 | MiniCPM-o 4.5 | same as B2 | SFT → GRPO | image + **speech-only** |
 
-**8 个研究问题**:A1 vs B2(主线)、A0 vs B0、A1 vs B1、A0 vs A1、B0 vs B1、B1 vs B2、B2 vs B3(文字 vs 语音)、2×2 交叉迁移(B2 测语音 / B3 测文本,零样本)。
+**8 research questions**: A1 vs B2 (headline), A0 vs B0, A1 vs B1, A0 vs A1, B0 vs B1, B1 vs B2, B2 vs B3 (text vs. speech language channel), and the 2×2 cross-modal transfer matrix (B2 evaluated on speech / B3 evaluated on text, zero-shot).
 
-**评测**:ID / OOD 成功率(10 种子 × 20 回合,±std)+ 鲁棒性指令 + 50 条失败轨迹定性分析。
+**Evaluation**: ID / OOD success rate (10 seeds × 20 episodes, mean ± std) + robustness instructions + qualitative analysis of 50 failed trajectories.
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 冒烟测试门禁(三卡并行)
+# 1. Smoke-test gate (3 GPUs in parallel)
 bash scripts/run_smokes.sh
 
-# 2. 单组冒烟
+# 2. Single-group smokes
 python scripts/train_sft.py   --group b2 --smoke 5 --device cuda:1
 python scripts/smoke_grpo.py  --group b2 --device cuda:1
 
-# 3. 正式训练(三卡排程,GPU0: A0→A1 | GPU1: B2 | GPU2: B0→B1→B3)
+# 3. Full training (3-GPU schedule: GPU0 A0→A1 | GPU1 B2 | GPU2 B0→B1→B3)
 VLA_DEVICE=cuda:0 bash scripts/run_group.sh a0 a1
 VLA_DEVICE=cuda:1 bash scripts/run_group.sh b2
 VLA_DEVICE=cuda:2 bash scripts/run_group.sh b0 b1 b3
 
-# 4. 评测(主线 + 2×2 交叉矩阵)
+# 4. Evaluation (mainline + 2×2 cross-modal matrix)
 python scripts/evaluate.py --group b2 --split id
-python scripts/evaluate.py --group b2 --split csi --modality audio   # B2 零样本听语音
-python scripts/evaluate.py --group b3 --split csi --modality text    # B3 零样本读文本
+python scripts/evaluate.py --group b2 --split csi --modality audio   # B2 zero-shot on speech
+python scripts/evaluate.py --group b3 --split csi --modality text    # B3 zero-shot on text
 ```
 
-## 冒烟测试状态 ✅
+## Smoke-Test Status ✅
 
-| 类别 | 状态 |
+| Category | Status |
 |---|---|
-| 19 项 CPU 冒烟(配置/泄漏/奖励/数据) | ✅ |
-| A0/A1 SFT、A1 GRPO | ✅ |
-| B0/B1/B2/B3 模型验证(前向/反向/logp/生成,B3 含音频) | ✅ |
-| B0/B1/B2 SFT、B3 SFT(语音-only) | ✅ |
-| B1/B2 GRPO、B3 GRPO(语音 rollout) | ✅ |
+| 19 CPU smokes (config / leakage / reward / data) | ✅ |
+| A0/A1 SFT, A1 GRPO | ✅ |
+| B0/B1/B2/B3 model verification (fwd/bwd/logp/generate; B3 incl. audio) | ✅ |
+| B0/B1/B2 SFT, B3 SFT (speech-only) | ✅ |
+| B1/B2 GRPO, B3 GRPO (speech rollout) | ✅ |
 
-## 项目结构
+## Repository Layout
 
 ```
-configs/           # 训练超参(base.yaml 锁定)+ 6 组实验配置
+configs/           # training hyperparameters (base.yaml locks shared config) + 6 group configs
 src/
-  models/          # OpenVLA / MiniCPM-o 包装 + 动作头
-  training/        # SFT / GRPO 训练器、奖励函数
-  envs/            # CALVIN 环境(headless)
-  rollout/         # HF 推理引擎
-  eval/            # 评测协议(ID/OOD/鲁棒/2×2 矩阵)
-scripts/           # 训练、冒烟、评测、数据预处理脚本
-docs/              # 实验方案、冒烟矩阵、数据管线、局限性
+  models/          # OpenVLA / MiniCPM-o wrappers + action heads
+  training/        # SFT / GRPO trainers, reward functions
+  envs/            # CALVIN environment (headless)
+  rollout/         # HF inference engine
+  eval/            # evaluation protocol (ID/OOD/robustness/2×2 matrix)
+scripts/           # training, smoke, evaluation, data-preprocessing scripts
+docs/              # experiment plan, smoke matrix, data pipeline, limitations
 ```
 
-## 环境
+## Environment
 
-- torch 2.5.1+cu124,transformers,hf-mirror 镜像
-- 3×32G vGPU;HF 引擎(不依赖 vLLM)
-- CALVIN env-A 窗口 + Bridge V2(1995 段);B3 用 CSI(合成 TTS 语音)
+- torch 2.5.1+cu124, transformers (hf-mirror)
+- 3×32 GB vGPUs; HF engine only (no vLLM dependency)
+- CALVIN env-A windows + Bridge V2 (1,995 episodes); B3 uses CSI (synthesized TTS speech)
 
-## 引用
+## References
 
 [MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o) · [OpenVLA](https://github.com/openvla/openvla) · [CALVIN](https://github.com/mees/calvin) · [GRPO (DeepSeekMath)](https://arxiv.org/abs/2402.03300)
