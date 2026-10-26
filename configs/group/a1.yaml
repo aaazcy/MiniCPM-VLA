@@ -1,0 +1,16 @@
+# A1: OpenVLA-OFT-7B, LoRA LLM + native action head, SFT -> GRPO (MAIN BASELINE)
+group:
+  id: A1
+  family: vla
+  model_id: /root/autodl-tmp/models/openvla-7b   # local snapshot (OFT base weights are not published)
+  train:
+    lora: true
+    lora_r: 16
+    lora_alpha: 32
+    freeze_vision: true
+    freeze_llm: false
+  sft_only: false
+  audio: false
+  dataset: [calvin, bridge]
+
+  rollout_engine_override: hf   # no vLLM on 32GB cards (colocation OOM); HF engine for all groups

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""scripts/evaluate.py — full evaluation protocol (ID / OOD / robustness).
+
+Usage:
+    python scripts/evaluate.py --group a1 --split id
+    python scripts/evaluate.py --group b2 --split ood
+    python scripts/evaluate.py --group b2 --split robustness
+    python scripts/evaluate.py --group b2 --qualitative-failures   # 50 failed trajs
+
+Loads the best GRPO checkpoint (or best SFT checkpoint for SFT-only groups),
+runs 20 seeded repeats per episode, logs to wandb and writes JSON to runs/<group>/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.config import load_config  # noqa: E402
+from src.eval.evaluator import Evaluator  # noqa: E402
+from src.models.factory import build_model  # noqa: E402
+from src.rollout.engine import make_engine  # noqa: E402
+from src.utils.logger import Logger  # noqa: E402
+
+
+def load_instructions(manifest: Path):
+    """Collect (instruction, init_robot_obs, init_scene_obs) from a split manifest."""
+    import glob
+    root = manifest.parent.parent
+    split = manifest.stem.replace("calvin_", "")
+    with open(manifest) as f:
+        ids = json.load(f)["ids"]
+    instrs, init_states = [], []
+    for tid in ids:
+        candidates = glob.glob(str(root / split / f"{tid}.npz")) or \
+            glob.glob(str(root / "sft_train" / f"{tid}.npz")) or \
+            glob.glob(str(root / "id_test" / f"{tid}.npz")) or \
+            glob.glob(str(root / "ood_test" / f"{tid}.npz"))
+        if not candidates:
+            continue
+        with np.load(candidates[0]) as f_:
+            instrs.append(str(f_["lang"]))
+            if "init_robot_obs" in f_ and "init_scene_obs" in f_:
+                init_states.append((f_["init_robot_obs"].astype(np.float32),
+                                    f_["init_scene_obs"].astype(np.float32)))
+            else:
+                init_states.append(None)
+    return instrs, init_states
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--group", required=True, choices=["a0", "a1", "b0", "b1", "b2", "b3"])
+    ap.add_argument("--split", choices=["id", "ood", "robustness"], required=True)
+    ap.add_argument("--qualitative-failures", action="store_true",
+                    help="collect 50 failed trajectories for failure labeling")
+    ap.add_argument("--ckpt", default="auto", help="checkpoint dir | 'auto'")
+    ap.add_argument("--device", default="cuda")
+    args = ap.parse_args()
+
+    cfg = load_config(args.group)
+    torch.manual_seed(cfg.experiment.seed)
+    logger = Logger(cfg, cfg.group.id, tags=["eval"])
+
+    # checkpoint selection: GRPO best > SFT best (SFT-only groups)
+    if args.ckpt == "auto":
+        grpo_best = Path(cfg.grpo_ckpt_dir) / "last"
+        sft_best = Path(cfg.sft_ckpt_dir) / "best"
+        ckpt = grpo_best if (grpo_best / "trainer_state.pt").exists() else sft_best
+    else:
+        ckpt = Path(args.ckpt)
+    if not (ckpt / "trainer_state.pt").exists():
+        raise FileNotFoundError(f"no checkpoint at {ckpt}")
+
+    policy = build_model(cfg, stage="ref")  # eval mode, frozen
+    policy.load_adapter(str(ckpt))
+    policy.to(args.device)
+    policy.eval()
+
+    engine = make_engine(cfg, policy=policy, processor=policy.processor,
+                         lora_path=str(ckpt), device=args.device)
+    evaluator = Evaluator(cfg, policy, engine=engine, device=args.device)
+
+    calvin_root = Path(cfg.dataset.calvin_root)
+    if args.split == "id":
+        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
+        scenes = ["calvin_scene_A"] * len(instrs)
+    elif args.split == "ood":
+        # official ABC->D protocol: same validation instructions rendered in env D
+        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
+        scenes = ["calvin_scene_D"] * len(instrs)
+    else:
+        # robustness: paraphrased / reordered / long instructions (same episodes, new text)
+        rob_path = calvin_root / "splits" / "robust_instructions.json"
+        if not rob_path.exists():
+            raise FileNotFoundError(
+                f"{rob_path} missing — create it (paraphrased instructions keyed by "
+                "the same trajectory ids as calvin_id_test) or run "
+                "scripts/make_robust_set.py from the official lang_paraphrase file")
+        with open(rob_path) as f:
+            rob = json.load(f)
+        instrs, init_states = rob["instructions"], rob["init_states"] \
+            if "init_states" in rob else [None] * len(rob["instructions"])
+        scenes = ["calvin_scene_A"] * len(instrs)
+
+    if args.qualitative_failures:
+        failures = evaluator.collect_failures(
+            instrs, n_failed=cfg.qualitative.sample_failed_trajectories
+            if hasattr(cfg, "qualitative") else 20,
+            out_path=cfg.run_dir / "failures.json")
+        print(f"collected {len(failures)} failed trajectories -> {cfg.run_dir}/failures.json")
+        logger.finish()
+        return
+
+    metrics = evaluator.evaluate_subset(instrs, cfg.eval.seeds, cfg.eval.temperature,
+                                        scenes=scenes, init_states=init_states)
+    logger.log({f"eval/{args.split}/{k}": v for k, v in metrics.items()}, commit=True)
+    out = cfg.run_dir / f"eval_{args.split}.json"
+    with open(out, "w") as f:
+        json.dump({"group": cfg.group.id, "split": args.split, "ckpt": str(ckpt),
+                   "metrics": metrics}, f, indent=2)
+    print(f"[{cfg.group.id}/{args.split}] {json.dumps(metrics, indent=2)}\nSaved to {out}")
+    logger.finish()
+
+
+if __name__ == "__main__":
+    main()

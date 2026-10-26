@@ -1,0 +1,15 @@
+# B2: MiniCPM-o 4.5, LoRA(r=8, alpha=16) + action head, SFT -> GRPO (MAIN EXPERIMENT)
+group:
+  id: B2
+  family: omni
+  model_id: /root/autodl-tmp/models/MiniCPM-o-4_5   # local snapshot
+  train:
+    lora: true
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.0
+    freeze_vision: true
+    freeze_llm: false
+  sft_only: false
+  audio: false
+  dataset: [calvin, bridge]

@@ -1,0 +1,23 @@
+# Evaluation protocol (shared by all groups; used by scripts/evaluate.py)
+eval:
+  id_test: calvin_A_val        # held-out calvin_A official val split
+  ood_test: calvin_D           # cross-scene: new camera, new object layout
+  robustness: true             # paraphrased / reordered / long complex instructions
+  seeds: 20                    # repeats per episode -> mean +/- std
+  temperature: 0.0
+  report:
+    - full_task_success        # primary metric (ID, OOD)
+    - success_steps_to_50pct   # sample-efficiency curve thresholds
+    - success_steps_to_60pct
+    - mean_episode_return
+    - mean_steps_to_finish
+    - action_smoothness        # mean L2 between consecutive actions
+    - mean_ee_position_error
+    - robustness_success_degradation
+qualitative:
+  sample_failed_trajectories: 50
+  failure_labels: [language_misunderstanding, visual_localization_error,
+                   action_drift, wrong_temporal_planning, rl_local_loop]
+auxiliary_vlm:
+  target_object_recall: true
+  instruction_understanding_accuracy: true

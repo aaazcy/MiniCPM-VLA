@@ -1,0 +1,31 @@
+# Pinned for the preinstalled env: Python 3.12, CUDA 12.4, torch 2.5.1+cu124
+# Phase 0 (CPU) can run with: numpy, pyyaml, pydantic, pillow, librosa, edge-tts
+# Phase 1 (GPU) additionally needs: peft, accelerate, transformers, vllm, trl, wandb, calvin_env
+
+numpy>=1.26
+pyyaml>=6.0
+pydantic>=2.7
+pillow>=10.0
+tqdm
+librosa>=0.10          # audio (B3) preprocessing
+soundfile>=0.12
+edge-tts>=6.1          # B3 synthesized speech (primary TTS)
+
+# --- GPU phase (install after mounting the GPU) ---
+torch==2.5.1           # already present (cu124); do not downgrade
+vllm==0.6.6.post1      # cu124 wheel, torch 2.5 compatible — verify with check_env.py
+peft>=0.13
+accelerate>=1.0
+transformers>=4.46
+trl>=0.12              # loss utilities only (GRPO loop is custom for CALVIN)
+wandb>=0.18
+datasets>=3.0          # BridgeData V2 loading
+sentencepiece
+protobuf
+timm                   # OpenVLA vision deps
+hydra-core>=1.3        # required by calvin_env
+omegaconf
+# CALVIN env (pip install from git):
+#   pip install git+https://github.com/mees/calvin.git
+# OpenVLA (pip install from git):
+#   pip install git+https://github.com/openvla/openvla.git

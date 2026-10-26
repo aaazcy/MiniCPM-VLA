@@ -1,0 +1,22 @@
+# === 数据与模型(大文件,不入库)===
+data/
+models/
+runs/
+viz/
+
+# === 缓存与产物 ===
+__pycache__/
+*.pyc
+*.npz
+*.safetensors
+*.pt
+*.ckpt
+.part
+*.incomplete
+.hydra/
+
+# === 环境与工具 ===
+.env
+wandb/
+*.log
+/tmp/

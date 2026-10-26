@@ -1,0 +1,12 @@
+# B1: MiniCPM-o 4.5, FROZEN backbone, only action head trained, SFT -> GRPO
+group:
+  id: B1
+  family: omni
+  model_id: /root/autodl-tmp/models/MiniCPM-o-4_5   # local snapshot
+  train:
+    lora: false
+    freeze_vision: true
+    freeze_llm: true
+  sft_only: false
+  audio: false
+  dataset: [calvin, bridge]

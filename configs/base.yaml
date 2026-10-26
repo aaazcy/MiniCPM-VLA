@@ -1,0 +1,92 @@
+# =============================================================================
+# base.yaml — shared hyperparameters, LOCKED for all groups.
+# Per-group files in configs/group/ override only the fields that differ.
+# Never edit this file per-run; change the config and re-commit.
+# =============================================================================
+
+experiment:
+  name: vla_omni_bench
+  wandb_project: vla-vs-omni
+  wandb_entity: null
+  seed: 42
+  output_dir: /root/autodl-tmp/vla-omni-bench/runs
+  data_dir: /root/autodl-tmp/vla-omni-bench/data
+  hf_cache_dir: /root/autodl-tmp/hf_cache
+
+environment:
+  name: calvin
+  max_episode_steps: 100
+  action_dim: 7
+  image_size: 224
+  cameras: [rgb_static]        # single static camera, identical for both model families
+
+dataset:
+  calvin_root: ${experiment.data_dir}/calvin
+  bridge_root: ${experiment.data_dir}/bridge
+  csi_root: ${experiment.data_dir}/csi
+  train_ratio: 0.85            # 85% train / 15% SFT-val (SFT-val NEVER used in RL)
+  bridge_max_trajectories: 2000    # minimal subsample (post-training scale)
+  bridge_sample_seed: 42           # same seed for all groups -> identical subset
+  filter_collision: true
+  filter_stalled_gripper: true
+
+sft:
+  loss: mse                   # MSE(pred_action, demo_action)
+  optimizer: adamw
+  lr_action_head: 1.0e-4
+  lr_lora: 2.0e-5
+  batch_size: 2               # trajectories per batch (see steps_per_traj)
+  steps_per_traj: 2           # steps sampled per trajectory -> effective step batch = 4
+  weight_decay: 1.0e-4
+  gradient_checkpointing: true
+  max_epochs: 2               # few-demo LoRA converges fast (measured: MSE ~0.04 by step 250)
+  early_stop_patience: 1      # stop 1 epoch after the SFT-val MSE stops improving
+  bf16: true
+
+grpo:
+  group_size: 4
+  rollout_per_group: 4        # total trajectories per update = 4 * 4 = 16
+  clip_eps: 0.2
+  beta_kl: 0.05
+  lr_action_head: 1.0e-4
+  lr_lora: 2.0e-5
+  max_grad_norm: 1.0
+  optimizer: adamw
+  bf16: true
+  total_env_steps: 20000      # minimal post-training budget (~30 updates; raise for A1/B2 if needed)
+  eval_every_episodes: 2000   # deterministic eval (temp=0, no noise) + checkpoint
+  max_traj_len: 60            # rollout truncation (env still caps eval at 100)
+
+reward:                       # FIXED for all groups
+  success: 10.0
+  lambda_dist: 0.5
+  lambda_collide: 1.0
+  lambda_action: 0.1
+  collide_penalty: -2.0
+  use_progress_proxy_for_dist: true   # CALVIN lacks direct ee->target distance
+
+model:
+  action_head:
+    hidden_dim: 4096          # last-token hidden size (Llama2-7B & Qwen3-8B both 4096)
+    dims: [512, 256]
+    action_dim: 7
+    init_std: 0.02
+
+rollout:
+  engine: vllm                # "vllm" (vision groups) | "hf" (B3 audio / fallback)
+  gpu_memory_utilization: 0.85
+  temperature: 1.0            # training rollouts
+  max_new_tokens: 1           # action = single hidden -> head; keep 1
+  dtype: bfloat16
+
+eval:
+  temperature: 0.0            # deterministic
+  seeds: 10                   # repeats per test episode (was 20; 10 x 20 windows is enough)
+  max_episodes: 20            # cap episodes per split (speed: eval ~15 min/split)
+  id_test: calvin_A_val       # official held-out val split of calvin_A (never trained on)
+  ood_test: calvin_D
+  robustness: true            # paraphrased / reordered / long instructions
+
+wandb:
+  mode: online                # "online" | "offline"
+  log_every_steps: 10

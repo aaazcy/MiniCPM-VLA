@@ -1,0 +1,19 @@
+# B3: = B2 + Whisper audio encoder ON, synchronized 16kHz SYNTHESIZED speech input.
+# CSI dataset ablation ONLY — never compared head-to-head against group A.
+group:
+  id: B3
+  family: omni
+  model_id: /root/autodl-tmp/models/MiniCPM-o-4_5   # local snapshot
+  train:
+    lora: true
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.0
+    freeze_vision: true
+    freeze_llm: false
+  sft_only: false
+  audio: true                     # enable Whisper audio encoder
+  audio_sample_rate: 16000
+  dataset: [csi]                  # CSI trajectories (CALVIN + TTS-aligned wav)
+  is_ablation: true               # excluded from head-to-head comparison vs A
+  rollout_engine_override: hf     # stock vLLM lacks MiniCPM-o audio path
