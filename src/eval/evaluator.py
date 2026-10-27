@@ -59,11 +59,13 @@ class Evaluator:
                          audio_wav: Optional[np.ndarray] = None,
                          init_robot_obs: Optional[np.ndarray] = None,
                          init_scene_obs: Optional[np.ndarray] = None,
-                         scene: str = "calvin_scene_A") -> Dict:
+                         scene: str = "calvin_scene_A",
+                         task: Optional[str] = None) -> Dict:
         """Repeat one episode `seeds` times -> mean +/- std of all metrics.
 
         init_robot_obs/init_scene_obs: recorded episode start state (official CALVIN
         protocol). scene: calvin_scene_A (ID) or calvin_scene_D (OOD).
+        task: CALVIN subtask name (for success detection via the Tasks oracle).
         """
         if self.cfg.group.audio and audio_wav is None:
             audio_wav = self._load_instruction_audio(instruction)
@@ -75,7 +77,8 @@ class Evaluator:
                             image_size=self.cfg.environment.image_size,
                             seed=seed, calvin_root=Path(self.cfg.dataset.calvin_root),
                             scene=scene)
-            obs = env.reset(instruction, robot_obs=init_robot_obs, scene_obs=init_scene_obs)
+            obs = env.reset(instruction, robot_obs=init_robot_obs,
+                            scene_obs=init_scene_obs, task=task)
             traj = Trajectory()
             for _ in range(self.cfg.environment.max_episode_steps):
                 act = self.engine.act(obs, instruction, audio_wav=audio_wav,
@@ -119,8 +122,10 @@ class Evaluator:
 
     def evaluate_subset(self, instructions: List[str], seeds: int,
                         temperature: float, scenes: List[str] = None,
-                        init_states: List = None) -> Dict:
+                        init_states: List = None, tasks: List = None) -> Dict:
         instructions = instructions[: self.cfg.eval.max_episodes]
+        if tasks is not None:
+            tasks = tasks[: self.cfg.eval.max_episodes]
         aggr = {"success_rate": [], "mean_return": [], "mean_steps": [],
                 "action_smoothness": [], "mean_ee_error": []}
         for i, instr in enumerate(instructions):
@@ -128,8 +133,10 @@ class Evaluator:
             rs, ss = None, None
             if init_states and init_states[i] is not None:
                 rs, ss = init_states[i]
+            task = tasks[i] if tasks else None
             m = self.evaluate_episode(instr, seeds, temperature,
-                                      init_robot_obs=rs, init_scene_obs=ss, scene=scene)
+                                      init_robot_obs=rs, init_scene_obs=ss, scene=scene,
+                                      task=task)
             for k in aggr:
                 v = m[k]
                 if v is not None:
@@ -166,19 +173,21 @@ class Evaluator:
     # Qualitative: failure labeling (feeds viz/failure pie chart)
     # ------------------------------------------------------------------ #
     def collect_failures(self, instructions: List[str], n_failed: int = 20,
-                         out_path: Path = Path("runs/failures.json")) -> List[Dict]:
+                         out_path: Path = Path("runs/failures.json"),
+                         tasks: List = None) -> List[Dict]:
         """Sample failed trajectories and dump raw data for (manual/semi-automatic)
         failure labeling: language_misunderstanding / visual_localization_error /
         action_drift / wrong_temporal_planning / rl_local_loop."""
         failures = []
-        for instr in instructions:
+        for i, instr in enumerate(instructions):
             if len(failures) >= n_failed:
                 break
+            task = tasks[i] if tasks else None
             env = CalvinEnv(max_episode_steps=self.cfg.environment.max_episode_steps,
                             cameras=self.cfg.environment.cameras,
                             image_size=self.cfg.environment.image_size,
                             seed=0, calvin_root=Path(self.cfg.dataset.calvin_root))
-            obs = env.reset(instr)
+            obs = env.reset(instr, task=task)
             traj = Trajectory()
             for _ in range(self.cfg.environment.max_episode_steps):
                 act = self.engine.act(obs, instr, temperature=0.0)

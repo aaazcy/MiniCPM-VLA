@@ -19,6 +19,29 @@ ACTION_DIM = 7
 # CALVIN relative actions are consumed by the env in dataset units (already normalized
 # to [-1,1]: pos factor 50, rot factor 20, gripper ±1) — see the official dataset README.
 
+_TASKS = None
+
+
+def _get_tasks():
+    """Lazily build the CALVIN `Tasks` success oracle from the NEW play-table config.
+
+    The raw env only reports {robot_info, scene_info}; success is computed by comparing
+    start vs current scene_info against the task definitions in
+    calvin_env/conf/tasks/new_playtable_tasks.yaml (matching the object names in the
+    language annotation `task` field).
+    """
+    global _TASKS
+    if _TASKS is None:
+        import calvin_env
+        import yaml
+        from calvin_env.envs.tasks import Tasks
+
+        cfg_path = Path(calvin_env.__file__).parents[1] / "conf" / "tasks" / \
+            "new_playtable_tasks.yaml"
+        cfg = yaml.safe_load(open(cfg_path))
+        _TASKS = Tasks(cfg["tasks"])
+    return _TASKS
+
 
 class CalvinEnv:
     """Thin, dependency-safe wrapper. Import of calvin_env is lazy so the package
@@ -62,14 +85,19 @@ class CalvinEnv:
         self._lang_annotation: Optional[Any] = None
         self._last_action: Optional[np.ndarray] = None
         self._collision = False
+        self._task: Optional[str] = None          # CALVIN subtask name (for success)
+        self._start_info: Optional[Dict] = None    # scene_info captured at reset
+        self._tasks = _get_tasks()                 # shared success oracle
 
     # ------------------------------------------------------------------ #
     def reset(self, instruction: str, robot_obs: Optional[np.ndarray] = None,
-              scene_obs: Optional[np.ndarray] = None) -> Dict[str, Any]:
+              scene_obs: Optional[np.ndarray] = None, task: Optional[str] = None) -> Dict[str, Any]:
         """Reset with a (possibly paraphrased/long) language instruction.
 
         robot_obs/scene_obs: optional recorded initial state (official CALVIN eval
         protocol resets each episode from its recorded start state).
+        task: the CALVIN subtask name (from lang_annotations/auto_lang_ann.npy's
+        `task` field) — required for success detection via the Tasks oracle.
         """
         # The calvin_env robot/scene reset code indexes these with lists of ints and
         # np.split — which only works for flat float32 ndarrays. Robustness manifests
@@ -80,6 +108,8 @@ class CalvinEnv:
             scene_obs = np.asarray(scene_obs, dtype=np.float32).reshape(-1)
         obs = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
         self._instruction = instruction
+        self._task = task
+        self._start_info = self.env.get_info()  # {robot_info, scene_info} at episode start
         self._lang_annotation = self.env.get_lang_ann() if hasattr(self.env, "get_lang_ann") else None
         self._steps = 0
         self._last_action = None
@@ -99,10 +129,20 @@ class CalvinEnv:
         act[6] = 1.0 if act[6] >= 0.0 else -1.0
         obs, _, _, info = self.env.step(act)
         self._steps += 1
-        done = bool(info.get("success", False)) or self._steps >= self.max_episode_steps
+
+        # CALVIN success detection: the raw env only returns {robot_info, scene_info}
+        # (no success/subtask keys). Compute success by comparing the episode-start
+        # scene_info against the current one via the Tasks oracle.
+        success = False
+        if self._task is not None and self._start_info is not None:
+            completed = self._tasks.get_task_info(self._start_info, info)
+            success = self._task in completed
+
+        done = bool(success) or self._steps >= self.max_episode_steps
+        info["success"] = bool(success)
         info["truncated"] = self._steps >= self.max_episode_steps
-        info["subtasks_completed"] = float(info.get("subtasks_completed", 0.0))
-        info["subtasks_total"] = float(info.get("subtasks_total", 0.0))
+        info["subtasks_completed"] = float(1.0 if success else 0.0)
+        info["subtasks_total"] = 1.0
         info["collision"] = bool(info.get("collision", self._collision))
         info["ee_target_dist"] = info.get("ee_target_dist", None)  # None -> progress proxy
         if self._last_action is not None:

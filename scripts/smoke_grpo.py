@@ -38,10 +38,10 @@ class _Sampler:
         self.instrs = instrs
 
     def sample(self):
-        return self.instrs[0]
+        return self.instrs[0], None
 
     def sample_eval(self, n):
-        return self.instrs[:n]
+        return [(i, None) for i in self.instrs[:n]]
 
 
 def main():

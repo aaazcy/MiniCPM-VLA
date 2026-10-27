@@ -96,7 +96,7 @@ def load_step(step_path: Path) -> dict:
 def _build_segment(args) -> object:
     """Worker: build one trajectory npz from a 64-step window. Returns (traj_id, npz_path)
     or None if filtered."""
-    raw_split_dir, out_dir, prefix, w0, w1, ann = args
+    raw_split_dir, out_dir, prefix, w0, w1, ann, task = args
     w0, w1 = int(w0), int(w1)
     if w1 - w0 + 1 < MIN_SEGMENT_STEPS:
         return None
@@ -118,7 +118,7 @@ def _build_segment(args) -> object:
     np.savez_compressed(
         out_path,
         rgb=rgb.astype(np.uint8), actions=actions.astype(np.float32),
-        proprio=proprio.astype(np.float32), lang=ann,
+        proprio=proprio.astype(np.float32), lang=ann, task=task,
         init_robot_obs=steps[0]["robot_obs"].astype(np.float32),
         init_scene_obs=steps[0]["scene_obs"].astype(np.float32))
     return traj_id
@@ -138,19 +138,21 @@ def process_calvin(raw_root: Path, lang_train_path: Path, lang_val_path: Path,
     with open(plan_path) as f:
         plan = json.load(f)
 
-    def window_ann(lang: dict, w0: int, w1: int) -> str:
-        for ann, (a0, a1) in zip(lang["ann"], lang["indx"]):
+    def window_ann(lang: dict, w0: int, w1: int):
+        """Return (instruction text, task name) for a window (for success checking)."""
+        for ann, task, (a0, a1) in zip(lang["ann"], lang["task"], lang["indx"]):
             if int(a0) == w0 and int(a1) == w1:
-                return ann
-        return lang["ann"][0]
+                return ann, task
+        return lang["ann"][0], lang["task"][0]
 
     def collect_windows(raw_split_dir: Path, windows, lang: dict, prefix: str) -> list:
         out_dir = out_root / prefix
         out_dir.mkdir(parents=True, exist_ok=True)
         jobs = []
         for (w0, w1) in windows:
+            ann, task = window_ann(lang, int(w0), int(w1))
             jobs.append((str(raw_split_dir), str(out_dir), prefix, int(w0), int(w1),
-                         window_ann(lang, int(w0), int(w1))))
+                         ann, task))
         from concurrent.futures import ProcessPoolExecutor
         ids = []
         with ProcessPoolExecutor(max_workers=8) as ex:

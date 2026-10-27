@@ -31,13 +31,13 @@ from src.utils.logger import Logger  # noqa: E402
 
 
 def load_instructions(manifest: Path):
-    """Collect (instruction, init_robot_obs, init_scene_obs) from a split manifest."""
+    """Collect (instruction, task, init_robot_obs, init_scene_obs) from a split manifest."""
     import glob
     root = manifest.parent.parent
     split = manifest.stem.replace("calvin_", "")
     with open(manifest) as f:
         ids = json.load(f)["ids"]
-    instrs, init_states = [], []
+    instrs, tasks, init_states = [], [], []
     for tid in ids:
         candidates = glob.glob(str(root / split / f"{tid}.npz")) or \
             glob.glob(str(root / "sft_train" / f"{tid}.npz")) or \
@@ -47,12 +47,13 @@ def load_instructions(manifest: Path):
             continue
         with np.load(candidates[0]) as f_:
             instrs.append(str(f_["lang"]))
+            tasks.append(str(f_["task"]) if "task" in f_ else None)
             if "init_robot_obs" in f_ and "init_scene_obs" in f_:
                 init_states.append((f_["init_robot_obs"].astype(np.float32),
                                     f_["init_scene_obs"].astype(np.float32)))
             else:
                 init_states.append(None)
-    return instrs, init_states
+    return instrs, tasks, init_states
 
 
 def main():
@@ -69,12 +70,18 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quick", action="store_true",
                     help="cold-start probe: 5 instructions x 3 seeds (~15 min)")
+    ap.add_argument("--shard", type=int, nargs=2, default=None, metavar=("K", "N"),
+                    help="evaluate instructions[K::N] (split the eval across N GPUs)")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="override eval temperature (e.g. 1.0 for stochastic-rollout probe)")
     args = ap.parse_args()
 
     cfg = load_config(args.group)
     if args.quick:
         cfg.eval.max_episodes = 5
         cfg.eval.seeds = 3
+    if args.temperature is not None:
+        cfg.eval.temperature = args.temperature
     # Cross-modal override: rebuild the SAME model with the other input channel.
     # Base weights are identical across B groups, so B2-ckpt-on-audio and
     # B3-ckpt-on-text are valid zero-shot transfer tests.
@@ -87,11 +94,18 @@ def main():
     torch.manual_seed(cfg.experiment.seed)
     logger = Logger(cfg, cfg.group.id, tags=["eval"])
 
-    # checkpoint selection: GRPO best > SFT best (SFT-only groups)
+    # checkpoint selection: GRPO best > SFT best (SFT-only groups) — but ONLY
+    # checkpoints whose action-head config matches the current one (stale
+    # checkpoints from a previous head architecture are skipped loudly)
     if args.ckpt == "auto":
+        from src.utils.ckpt import pick_compatible_ckpt
         grpo_best = Path(cfg.grpo_ckpt_dir) / "last"
         sft_best = Path(cfg.sft_ckpt_dir) / "best"
-        ckpt = grpo_best if (grpo_best / "trainer_state.pt").exists() else sft_best
+        ckpt = pick_compatible_ckpt([grpo_best, sft_best], cfg)
+        if ckpt is None:
+            raise FileNotFoundError(
+                f"no compatible checkpoint in {cfg.grpo_ckpt_dir} or "
+                f"{cfg.sft_ckpt_dir} (action-head config: {cfg.model.action_head})")
     else:
         ckpt = Path(args.ckpt)
     if not (ckpt / "trainer_state.pt").exists():
@@ -108,17 +122,17 @@ def main():
 
     calvin_root = Path(cfg.dataset.calvin_root)
     if args.split == "id":
-        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
+        instrs, tasks, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
         scenes = ["calvin_scene_A"] * len(instrs)
     elif args.split == "ood":
         # official ABC->D protocol: same validation instructions rendered in env D
-        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
+        instrs, tasks, init_states = load_instructions(calvin_root / "splits" / "calvin_id_test.json")
         scenes = ["calvin_scene_D"] * len(instrs)
     elif args.split == "csi":
         # cross-modal 2x2 matrix: grpo_eval windows (16 instructions, ALL have
         # synthesized wavs) — the same fixed set is used for audio AND text
         # evals so the two channels are directly comparable.
-        instrs, init_states = load_instructions(calvin_root / "splits" / "calvin_grpo_eval.json")
+        instrs, tasks, init_states = load_instructions(calvin_root / "splits" / "calvin_grpo_eval.json")
         scenes = ["calvin_scene_A"] * len(instrs)
     else:
         # robustness: paraphrased / reordered / long instructions (same episodes, new text)
@@ -132,24 +146,36 @@ def main():
             rob = json.load(f)
         instrs, init_states = rob["instructions"], rob["init_states"] \
             if "init_states" in rob else [None] * len(rob["instructions"])
+        # robustness keeps the SAME trajectory ids as id_test -> reuse their task names
+        tasks = rob.get("tasks", [None] * len(instrs))
         scenes = ["calvin_scene_A"] * len(instrs)
+
+    if args.shard is not None:
+        k, n = args.shard
+        instrs = instrs[k::n]
+        tasks = tasks[k::n]
+        init_states = init_states[k::n]
+        scenes = scenes[k::n]
 
     if args.qualitative_failures:
         failures = evaluator.collect_failures(
             instrs, n_failed=cfg.qualitative.sample_failed_trajectories
             if hasattr(cfg, "qualitative") else 20,
-            out_path=cfg.run_dir / "failures.json")
+            out_path=cfg.run_dir / "failures.json", tasks=tasks)
         print(f"collected {len(failures)} failed trajectories -> {cfg.run_dir}/failures.json")
         logger.finish()
         return
 
     metrics = evaluator.evaluate_subset(instrs, cfg.eval.seeds, cfg.eval.temperature,
-                                        scenes=scenes, init_states=init_states)
+                                        scenes=scenes, init_states=init_states, tasks=tasks)
     logger.log({f"eval/{args.split}/{k}": v for k, v in metrics.items()}, commit=True)
     out = cfg.run_dir / f"eval_{args.split}_{args.modality}.json"
+    shard_tag = f"_shard{args.shard[0]}of{args.shard[1]}" if args.shard else ""
+    out = cfg.run_dir / f"eval_{args.split}_{args.modality}{shard_tag}.json"
     with open(out, "w") as f:
         json.dump({"group": cfg.group.id, "split": args.split,
-                   "modality": args.modality, "ckpt": str(ckpt),
+                   "modality": args.modality, "shard": args.shard,
+                   "ckpt": str(ckpt), "n_instructions": len(instrs),
                    "metrics": metrics}, f, indent=2)
     print(f"[{cfg.group.id}/{args.split}/{args.modality}] "
           f"{json.dumps(metrics, indent=2)}\nSaved to {out}")

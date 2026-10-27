@@ -51,6 +51,12 @@ def main():
     if not (sft_ckpt / "trainer_state.pt").exists():
         raise FileNotFoundError(f"SFT checkpoint missing at {sft_ckpt}; "
                                 f"run train_sft.py --group {cfg.group.id} first")
+    from src.utils.ckpt import head_compatible
+    if not head_compatible(sft_ckpt, cfg):
+        raise SystemExit(
+            f"SFT checkpoint {sft_ckpt} uses a different action-head config than "
+            f"the current one ({cfg.model.action_head}). Retrain SFT or fix the "
+            f"config — loading it would crash with a shape mismatch.")
 
     logger = Logger(cfg, cfg.group.id, tags=["grpo", cfg.group.family])
 

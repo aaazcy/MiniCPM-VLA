@@ -16,24 +16,26 @@ import numpy as np
 
 
 class InstructionSampler:
-    def __init__(self, train_instructions: List[str], eval_instructions: List[str],
-                 seed: int = 42):
+    def __init__(self, train_instructions: List, eval_instructions: List, seed: int = 42):
+        # each element is (instruction_text, task_name); task_name is None if unknown
         self.train = list(train_instructions)
         self.eval = list(eval_instructions)
         self.rng = random.Random(seed)
 
-    def sample(self) -> str:
+    def sample(self):
+        """Return (instruction, task) pair."""
         return self.rng.choice(self.train)
 
-    def sample_eval(self, n: int) -> List[str]:
-        rng = random.Random(0)  # fixed order for eval determinism
+    def sample_eval(self, n: int):
+        """Return list of (instruction, task) pairs (fixed order for eval determinism)."""
+        rng = random.Random(0)
         pool = list(self.eval)
         rng.shuffle(pool)
         return pool[:n]
 
 
-def _load_instr(root: Path, manifest_name: str, fallback_dir: str) -> List[str]:
-    instrs = []
+def _load_pairs(root: Path, manifest_name: str, fallback_dir: str) -> List:
+    pairs = []
     with open(root / "splits" / f"{manifest_name}.json") as f:
         ids = json.load(f)["ids"]
     for tid in ids:
@@ -41,13 +43,15 @@ def _load_instr(root: Path, manifest_name: str, fallback_dir: str) -> List[str]:
         if not p.exists():
             p = root / "sft_train" / f"{tid}.npz"
         with np.load(p) as f_:
-            instrs.append(str(f_["lang"]))
-    return instrs
+            instr = str(f_["lang"])
+            task = str(f_["task"]) if "task" in f_ else None
+            pairs.append((instr, task))
+    return pairs
 
 
 def load_instruction_pools(cfg) -> InstructionSampler:
     """GRPO rollouts sample sft_train; deterministic eval uses grpo_eval."""
     root = Path(cfg.dataset.calvin_root)
-    train_instr = _load_instr(root, "calvin_sft_train", "sft_train")
-    eval_instr = _load_instr(root, "calvin_grpo_eval", "sft_train")
-    return InstructionSampler(train_instr, eval_instr, seed=cfg.experiment.seed)
+    train_pairs = _load_pairs(root, "calvin_sft_train", "sft_train")
+    eval_pairs = _load_pairs(root, "calvin_grpo_eval", "sft_train")
+    return InstructionSampler(train_pairs, eval_pairs, seed=cfg.experiment.seed)
