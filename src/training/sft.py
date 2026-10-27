@@ -187,6 +187,10 @@ class SFTTrainer:
                     break
             if self.is_main:
                 self.save(ckpt_dir / "last")
+                # versioned per-epoch checkpoint (never overwritten) so each epoch can
+                # be evaluated and the best-by-ID-success one picked for GRPO — val loss
+                # is only a proxy, not the final metric.
+                self.save(ckpt_dir / f"epoch_{epoch}")
 
         if self.is_main:
             with open(ckpt_dir / "history.json", "w") as f:
