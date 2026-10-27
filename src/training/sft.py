@@ -54,7 +54,7 @@ class SFTTrainer:
         self.opt = make_optimizer(model, cfg.sft.lr_action_head, cfg.sft.lr_lora,
                                   cfg.sft.weight_decay)
         self.loss_fn = nn.MSELoss()
-        self.best_val_mse = float("inf")
+        self.best_val_loss = float("inf")
         self.patience_left = cfg.sft.early_stop_patience
         self.epoch = 0
         self.global_step = 0
@@ -70,9 +70,14 @@ class SFTTrainer:
 
     # ------------------------------------------------------------------ #
     def run_epoch(self, loader, logger: Logger, train: bool = True,
-                  max_batches: int = None) -> float:
+                  max_batches: int = None):
+        """Run one epoch -> (mean_loss, mean_mse).
+
+        mean_loss is the optimization objective (CE for discrete heads, MSE for A);
+        mean_mse is the expected-action MSE (diagnostic, cross-family comparable).
+        """
         self.model.train(train)
-        total_mse, n = 0.0, 0
+        total_loss, total_mse, n = 0.0, 0.0, 0
         torch.set_grad_enabled(train)
         for bi, batch in enumerate(loader):
             if batch is None:  # collate can drop empty batches (B3 wav missing)
@@ -95,6 +100,7 @@ class SFTTrainer:
                     pred = self.model(px, batch["langs"], audio, act)
                     loss = self.loss_fn(pred, act)
                     mse = float(loss.detach())
+            loss_val = float(loss.detach())
 
             if train:
                 self.opt.zero_grad(set_to_none=True)
@@ -102,12 +108,13 @@ class SFTTrainer:
                 torch.nn.utils.clip_grad_norm_(self.raw.trainable_parameters(), 1.0)
                 self.opt.step()
                 if self.is_main and self.global_step % self.cfg.wandb.log_every_steps == 0:
-                    logger.log({"sft/train_mse": mse, "sft/train_loss": float(loss),
+                    logger.log({"sft/train_mse": mse, "sft/train_loss": loss_val,
                                 "sft/step": self.global_step}, step=self.global_step)
+            total_loss += loss_val * len(act)
             total_mse += mse * len(act)
             n += len(act)
             self.global_step += 1
-        return total_mse / max(n, 1)
+        return total_loss / max(n, 1), total_mse / max(n, 1)
 
     # ------------------------------------------------------------------ #
     def train(self, train_loader, val_loader, logger: Logger,
@@ -124,44 +131,50 @@ class SFTTrainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if smoke_steps:
-            train_mse = self.run_epoch(train_loader, logger, train=True,
-                                       max_batches=smoke_steps)
+            train_loss, train_mse = self.run_epoch(train_loader, logger, train=True,
+                                                   max_batches=smoke_steps)
             # ALL ranks run val (no collectives, but keeps ranks in lockstep so
             # nobody destroys the process group while others still sync)
-            val_mse = self.run_epoch(val_loader, logger, train=False,
-                                     max_batches=smoke_steps)
+            val_loss, val_mse = self.run_epoch(val_loader, logger, train=False,
+                                               max_batches=smoke_steps)
             if self.is_main:
-                logger.log({"sft/smoke_train_mse": train_mse,
-                            "sft/smoke_val_mse": val_mse})
-                log.info("[SFT smoke] train mse %.6f | val mse %.6f", train_mse, val_mse)
+                logger.log({"sft/smoke_train_mse": train_mse, "sft/smoke_val_mse": val_mse,
+                            "sft/smoke_train_loss": train_loss,
+                            "sft/smoke_val_loss": val_loss})
+                log.info("[SFT smoke] train loss %.4f / mse %.4f | val loss %.4f / mse %.4f",
+                         train_loss, train_mse, val_loss, val_mse)
                 self.save(ckpt_dir / "smoke")
             return ckpt_dir / "smoke"
-        history: Dict[str, list] = {"train_mse": [], "val_mse": []}
+        history: Dict[str, list] = {"train_loss": [], "val_loss": [],
+                                    "train_mse": [], "val_mse": []}
 
         for epoch in range(self.epoch, self.cfg.sft.max_epochs):
             self.epoch = epoch
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
-            train_mse = self.run_epoch(train_loader, logger, train=True)
+            train_loss, train_mse = self.run_epoch(train_loader, logger, train=True)
             # ALL ranks run val: keeps ranks in lockstep (main-only val lets
             # non-main ranks exit/destroy the group while main still syncs)
-            val_mse = self.run_epoch(val_loader, logger, train=False)
+            val_loss, val_mse = self.run_epoch(val_loader, logger, train=False)
             if self.is_main:
+                history["train_loss"].append(train_loss)
+                history["val_loss"].append(val_loss)
                 history["train_mse"].append(train_mse)
                 history["val_mse"].append(val_mse)
-                logger.log({"sft/epoch": epoch, "sft/train_mse_epoch": train_mse,
-                            "sft/val_mse": val_mse}, step=epoch)
-                log.info("[SFT] epoch %d | train mse %.6f | val mse %.6f", epoch, train_mse, val_mse)
+                logger.log({"sft/epoch": epoch, "sft/train_loss_epoch": train_loss,
+                            "sft/val_loss": val_loss, "sft/val_mse": val_mse}, step=epoch)
+                log.info("[SFT] epoch %d | train loss %.4f / val loss %.4f | val mse %.4f",
+                         epoch, train_loss, val_loss, val_mse)
 
-            if val_mse < self.best_val_mse - 1e-7:
-                self.best_val_mse = val_mse
+            if val_loss < self.best_val_loss - 1e-7:
+                self.best_val_loss = val_loss
                 self.patience_left = self.cfg.sft.early_stop_patience
                 if self.is_main:
                     self.save(ckpt_dir / "best")
             else:
                 self.patience_left -= 1
                 if self.patience_left <= 0:
-                    log.info("[SFT] early stop at epoch %d (val mse plateau)", epoch)
+                    log.info("[SFT] early stop at epoch %d (val loss plateau)", epoch)
                     break
             if self.is_main:
                 self.save(ckpt_dir / "last")
@@ -176,13 +189,13 @@ class SFTTrainer:
         path.mkdir(parents=True, exist_ok=True)
         self.raw.save_adapter(str(path))
         torch.save({"opt": self.opt.state_dict(), "epoch": self.epoch,
-                    "best_val_mse": self.best_val_mse, "cfg": self.cfg.to_dict()},
+                    "best_val_loss": self.best_val_loss, "cfg": self.cfg.to_dict()},
                    path / "trainer_state.pt")
 
     def _load_state(self, path: Path):
         state = torch.load(path / "trainer_state.pt", map_location="cpu")
         self.opt.load_state_dict(state["opt"])
         self.epoch = state["epoch"] + 1
-        self.best_val_mse = state["best_val_mse"]
+        self.best_val_loss = state.get("best_val_loss", state.get("best_val_mse", float("inf")))
         self.model.load_adapter(str(path))
         log.info("[SFT] resumed from %s (next epoch %d)", path, self.epoch)
