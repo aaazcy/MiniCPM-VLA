@@ -1,14 +1,16 @@
 """src/training/rewards.py — the fixed reward function (identical for ALL groups).
 
-R = R_success + lambda_dist * R_dist + lambda_collide * R_collide + lambda_action * R_action
+R = R_success + lambda_dist * R_dist + lambda_action * R_action
 
   * R_success = +10 on full task success (all subtasks of the instruction chain done)
   * R_dist    = negative L2 distance end-effector -> target
                 (CALVIN does not expose a per-subtask target distance; when unavailable
                  we use a subtask-progress proxy: -(1 - progress) * 10. Identical for all
                  groups, so relative comparisons remain valid — see limitations.md.)
-  * R_collide = -2 per collision step
   * R_action  = -mean L2 jitter between consecutive actions
+
+(subtask_completion removed: single-subtask data -> collinear with success;
+ collision removed: CALVIN env never reports collision -> constant no-op)
 """
 from __future__ import annotations
 
@@ -37,7 +39,6 @@ def compute_reward(traj: Trajectory, cfg) -> float:
     """Total reward for one rollout trajectory (sum over steps)."""
     r = cfg.reward
     total = 0.0
-    steps = max(1, traj.length)
     for i, info in enumerate(traj.infos):
         # ---- success (terminal, +10) ----
         if info.get("success", False):
@@ -54,10 +55,6 @@ def compute_reward(traj: Trajectory, cfg) -> float:
             progress = done_sub / tot_sub
             r_dist = -(1.0 - progress) * 10.0 if r.use_progress_proxy_for_dist else 0.0
         total += r.lambda_dist * r_dist
-
-        # ---- collision ----
-        if info.get("collision", False):
-            total += r.lambda_collide * r.collide_penalty
 
         # ---- action jitter ----
         if i > 0:

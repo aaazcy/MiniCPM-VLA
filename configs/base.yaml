@@ -35,13 +35,14 @@ sft:
   optimizer: adamw
   lr_action_head: 1.0e-4
   lr_lora: 2.0e-5
-  batch_size: 1               # trajectories (train) / chunks (val) per batch
-  steps_per_traj: 4           # random chunk length sampled per trajectory per epoch
-  val_chunk_size: 8           # val is pre-chunked to this size for full-frame coverage
+  batch_size: 1               # chunks per batch (train & val)
+  steps_per_traj: 4           # train chunk size: each trajectory is split into chunks so
+                              # every frame is seen each epoch (full coverage, 4 samples/forward)
+  val_chunk_size: 8           # val chunk size (larger: faster eval, no gradients)
   weight_decay: 1.0e-4
   gradient_checkpointing: true
-  max_epochs: 6               # CALVIN-only; early stopping on SFT-val MSE
-  early_stop_patience: 1      # stop 1 epoch after the SFT-val MSE stops improving
+  max_epochs: 2               # full-coverage chunking => 2 epochs = 2 passes over all frames
+  early_stop_patience: 1      # stop 1 epoch after the SFT-val loss stops improving
   bf16: true
 
 grpo:
@@ -49,7 +50,8 @@ grpo:
   rollout_per_group: 4        # total trajectories per update = 4 * 4 = 16
   clip_eps: 0.2
   beta_kl: 0.05
-  lr_action_head: 1.0e-4
+  lr_action_head: 1.0e-4      # LoRA+head, near-sparse reward, ~21 updates -> match SFT lr
+                              # (the old 1e-5/2e-6 was TGRPO/ThinkAct's full-model lr, too small here)
   lr_lora: 2.0e-5
   max_grad_norm: 1.0
   optimizer: adamw
@@ -61,10 +63,10 @@ grpo:
 reward:                       # FIXED for all groups
   success: 10.0
   lambda_dist: 0.5
-  lambda_collide: 1.0
   lambda_action: 0.1
-  collide_penalty: -2.0
   use_progress_proxy_for_dist: true   # CALVIN lacks direct ee->target distance
+  # (subtask_completion removed: single-subtask data -> collinear with success;
+  #  collision removed: CALVIN env never reports collision -> constant no-op)
 
 model:
   action_head:

@@ -93,9 +93,7 @@ class GrpoCfg(BaseModel):
 class RewardCfg(BaseModel):
     success: float = 10.0
     lambda_dist: float = 0.5
-    lambda_collide: float = 1.0
     lambda_action: float = 0.1
-    collide_penalty: float = -2.0
     use_progress_proxy_for_dist: bool = True
 
 

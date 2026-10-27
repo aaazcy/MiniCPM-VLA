@@ -36,8 +36,8 @@ def test_configs():
     check("grpo hyperparams locked", (cfg.grpo.group_size, cfg.grpo.rollout_per_group,
                                        cfg.grpo.clip_eps, cfg.grpo.beta_kl) == (4, 4, 0.2, 0.05))
     check("lr split", (cfg.sft.lr_action_head, cfg.sft.lr_lora) == (1e-4, 2e-5))
-    check("reward lambdas", (cfg.reward.lambda_dist, cfg.reward.lambda_collide,
-                             cfg.reward.lambda_action) == (0.5, 1.0, 0.1))
+    check("reward lambdas", (cfg.reward.lambda_dist,
+                             cfg.reward.lambda_action) == (0.5, 0.1))
     b3 = load_config("b3")
     check("b3 ablation flag", b3.group.is_ablation and b3.group.audio)
     a1 = load_config("a1")
@@ -65,13 +65,13 @@ def test_rewards():
     traj = Trajectory()
     traj.actions = [np.zeros(7), np.ones(7) * 0.5]
     traj.infos = [{"success": False, "subtasks_completed": 1, "subtasks_total": 2,
-                   "collision": False, "action_jitter": 0.0},
+                   "action_jitter": 0.0},
                   {"success": True, "subtasks_completed": 2, "subtasks_total": 2,
-                   "collision": True, "action_jitter": 3.0}]
+                   "action_jitter": 3.0}]
     r = compute_reward(traj, cfg)
     # step0: progress proxy -(1-0.5)*10*0.5 = -2.5
-    # step1: +10 success, progress 1.0 -> 0, -2 collision, jitter ||0.5*1_7|| = sqrt(1.75)
-    expected = -2.5 + 10.0 - 2.0 - 0.1 * np.sqrt(1.75)
+    # step1: +10 success, progress 1.0 -> 0, jitter ||0.5*1_7|| = sqrt(1.75)
+    expected = -2.5 + 10.0 - 0.1 * np.sqrt(1.75)
     check("reward value", abs(r - expected) < 1e-6, f"{r} vs {expected}")
     R = np.array([[1.0, 2.0, 3.0, 4.0], [0.0, 10.0, 5.0, 5.0]])
     A = grpo_advantage(R, 4)
