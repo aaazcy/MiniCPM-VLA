@@ -71,6 +71,13 @@ class CalvinEnv:
         robot_obs/scene_obs: optional recorded initial state (official CALVIN eval
         protocol resets each episode from its recorded start state).
         """
+        # The calvin_env robot/scene reset code indexes these with lists of ints and
+        # np.split — which only works for flat float32 ndarrays. Robustness manifests
+        # store JSON lists; some npz variants store 2D/object arrays. Normalize.
+        if robot_obs is not None:
+            robot_obs = np.asarray(robot_obs, dtype=np.float32).reshape(-1)
+        if scene_obs is not None:
+            scene_obs = np.asarray(scene_obs, dtype=np.float32).reshape(-1)
         obs = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
         self._instruction = instruction
         self._lang_annotation = self.env.get_lang_ann() if hasattr(self.env, "get_lang_ann") else None

@@ -89,6 +89,11 @@ class Evaluator:
             traj.success = bool(traj.infos[-1].get("success", False)) if traj.infos else False
             trajs.append(traj)
             env.close()
+            # CRITICAL: free the env NOW. pybullet reuses DIRECT connection ids;
+            # if the old env's __del__ runs AFTER the next env connects (Python
+            # evaluates the RHS of `env = CalvinEnv(...)` before rebinding), its
+            # second disconnect() kills the new env's connection ("Not connected").
+            env = None
 
             successes.append(float(traj.success))
             returns.append(compute_reward(traj, self.cfg))
