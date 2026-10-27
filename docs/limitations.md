@@ -83,6 +83,9 @@
 
     Crucially, this does **not** cap our policy's success: the model is evaluated
     **closed-loop** (observes → acts → corrects drift each step), so it is unaffected by
-    open-loop replay drift. `calvin_env` does expose `reset_from_storage` (full state incl.
-    joint velocities), but the raw CALVIN step files do not serialize that state, so exact
-    (velocity-aware) replay is not available from the public dataset.
+    open-loop replay drift. We also verified the reset *mechanism* is not the cause: an A/B
+    replay of a scene-A `turn_on_led` demo with `reset_from_storage` (full serialized state
+    incl. joint velocities, reconstructed via `serialize()` after reset) still leaves the LED
+    untoggled (0 transitions), identical to the plain `reset(robot_obs, scene_obs)` path
+    (`scripts/diag_reset_ab.py`). The paper's 100% is therefore attributable to task/scene
+    robustness (scene D), not to a reset source or mechanism we lack.
