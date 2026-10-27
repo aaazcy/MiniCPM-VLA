@@ -61,3 +61,28 @@
     MiniCPM-o uses Qwen3 (2025). This gap is part of what the experiment measures, but
     reviewers may attribute language-dependent failure differences to it (see the
     failure-type pie chart for evidence).
+
+15. **Open-loop demo-replay fidelity is ~35%, and is NOT a model ceiling.** Replaying the
+    recorded CALVIN demonstrations *open-loop* — reset to the recorded initial state and
+    re-apply the recorded relative actions — succeeds on only ~35% of `id_test` windows
+    (`scripts/oracle_replay.py`): coarse tasks (open/close drawer, stack/unstack,
+    lightbulb) succeed, while contact-precise tasks (turn_on_led, rotate, lift, push) fail.
+    This is **not** a success-detection bug: replaying a failed `turn_on_led` demo leaves the
+    LED `logical_state` at 0 across all 65 steps (the gripper never presses the button),
+    while an `sft_train` counterpart of the same task toggles it — so the oracle is correct.
+
+    The cause is reset/execution drift. CALVIN stores only positions/orientations
+    (`robot_obs` 15-d, `scene_obs` 24-d) with **no velocities and no contacts**, so a reset
+    restores positions to ~0.1 mm but the physics re-settles; the actions are *relative*
+    deltas, so open-loop replay compounds the per-step error (the classic compounding-error
+    / DAgger problem, Ross et al. 2011). This is a known, benchmark-wide property: a recent
+    CALVIN case study reports exact-reset teacher replay at 14/14 (100%) vs 0/14 under a
+    neutral (symbolic) reset — i.e. demo-replay success is dominated by reset fidelity, not
+    by the demonstrations themselves. See *"Benchmark-path fidelity in parallel
+    robot-policy evaluation: a CALVIN case study", The Journal of Supercomputing (2026)*.
+
+    Crucially, this does **not** cap our policy's success: the model is evaluated
+    **closed-loop** (observes → acts → corrects drift each step), so it is unaffected by
+    open-loop replay drift. `calvin_env` does expose `reset_from_storage` (full state incl.
+    joint velocities), but the raw CALVIN step files do not serialize that state, so exact
+    (velocity-aware) replay is not available from the public dataset.

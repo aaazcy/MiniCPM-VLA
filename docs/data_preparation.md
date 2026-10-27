@@ -140,6 +140,31 @@ calvin_sft_train(~416)  calvin_sft_val(~76)  calvin_grpo_eval(16)  calvin_id_tes
 robust_instructions(34)
 ```
 
+### 4.1 各阶段各用哪些字段(SFT / GRPO / eval)
+
+同一个 npz 里的字段,不同阶段取不同的部分:
+
+| 字段 | SFT | GRPO rollout | GRPO 周期评估 | 最终 eval |
+|---|---|---|---|---|
+| `lang`(指令) | ✅ 采样 | ✅ 采样 | ✅(grpo_eval) | ✅(id_test/robust) |
+| `rgb`(图像) | ✅ 输入 | 仿真器现渲染 | 仿真器现渲染 | 仿真器现渲染 |
+| `actions`(动作) | ✅ 监督目标 | ❌(用 reward) | ❌ | ❌ |
+| `init_*_obs` | 评估用 | ❌(随机初始状态) | ✅(重置到记录态) | ✅(重置到记录态) |
+
+- **SFT**:读 `calvin_sft_train` 的 `rgb+actions+lang`,MSE(OpenVLA)/CE(离散头)模仿专家动作。
+- **GRPO rollout**:只读 `calvin_sft_train` 的 `lang`(文本),`env.reset(instruction)` 从
+  **随机初始状态**开始,靠仿真器 reward 试错,**不用演示动作**。
+- **GRPO 周期评估**:读 `calvin_grpo_eval`(16 条,从 sft_train 单独 hold-out),确定性
+  评估 + 选 checkpoint;rollout 不采样它。
+- **最终 eval**:`id_test`(34,环境 A)/`ood`(同 34 条,环境 D)/`robust`(改写指令),
+  训练全程不碰。
+
+**重复性(三层,关键结论):**
+1. 指令文本:SFT 与 GRPO **有意共享** `calvin_sft_train`(同一任务分布,GRPO 是 SFT 的
+   RL 延续,属正常、非泄漏)。
+2. 演示动作/图像:**不共享** —— SFT 用演示动作做监督,GRPO 用仿真器 reward。
+3. 测试集:**严格隔离** —— id_test/ood/robust 与 train/val/grpo_eval 全部 disjoint。
+
 ## 5. 最终数据集规模
 
 | 部分 | 大小 | 说明 |

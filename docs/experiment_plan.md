@@ -74,14 +74,14 @@ RL), and what does synchronized synthesized speech (B3) add?
   matching OpenVLA's native bins. This replaces the continuous MLP head that collapsed
   to the dataset mean in the first smoke runs.
 - **Env**: CALVIN (Franka, long-horizon chains), max 100 steps/episode, single static cam 224×224
-- **SFT**: discrete-head CE (MiniCPM-o) / native-bin MSE (OpenVLA); AdamW; lr head=1e-4,
-  LoRA=2e-5; batch 1 traj × 4 steps; wd 1e-4; grad ckpt; early stop on SFT-val loss
-  (val never used in RL)
+- **SFT**: discrete-head CE (MiniCPM-o) / native-bin CE (OpenVLA); AdamW; lr head=1e-4,
+  LoRA=2e-5; batch 1 chunk × 4 steps (full-coverage chunked sampling); wd 1e-4; grad ckpt;
+  early stop on SFT-val loss (val never used in RL)
 - **GRPO**: group_size=4, rollout_per_group=4, clip_eps=0.2, beta_kl=0.05; lr head=1e-4,
   LoRA=2e-5; max_grad_norm=1.0; group-relative advantage (no critic); KL vs frozen SFT
-  reference; deterministic eval (temp=0) every 200 episodes + checkpoint
-- **Reward**: R = R_success + 0.5·R_dist + 1.0·R_collide + 0.1·R_action
-  (success +10; dist −L2 ee→target with progress proxy; collide −2; action jitter penalty)
+  reference; deterministic eval (temp=0) every 2000 episodes + checkpoint
+- **Reward**: R = R_success + 0.5·R_dist + 0.1·R_action
+  (success +10; dist −L2 ee→target with progress proxy; action jitter penalty)
 - **Splits guard**: 85/15 train/SFT-val; ID test = env-A validation (held-out); OOD = env-D;
   robustness = official paraphrased instructions; sha256 manifests, leak assertions on load
 
@@ -114,8 +114,8 @@ RL), and what does synchronized synthesized speech (B3) add?
 |---|---|---|---|
 | CALVIN SFT data | calvin_A split (603k steps) | ~500 windows / ~32k steps | LoRA few-demo scale; controlled comparison needs consistency, not volume |
 | Bridge | 20k+ trajs | **0 (removed)** | CALVIN-only main experiment; Bridge optional ablation only |
-| SFT epochs | 20 | 6 (+early stop) | LoRA converges fast on small data |
-| GRPO env steps | 400k | **40k** | ~60 GRPO updates — enough for a stable trend at 16 trajs/update |
+| SFT epochs | 20 | 2 (full-coverage chunked) | LoRA converges fast on small data |
+| GRPO env steps | 400k | **20k** | ~21 GRPO updates (16 trajs/update) — minimal trend; raise if needed |
 | Rollout episode cap | 100 | 60 | shorter rollouts, same action space |
 | Eval during GRPO | every 200 eps × 8 | every 2000 eps × 5 | 10× fewer eval env steps |
 | Qualitative failures | 50/group | 20/group | pie chart still interpretable |

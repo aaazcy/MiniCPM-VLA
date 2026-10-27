@@ -15,7 +15,7 @@ Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipul
 
 ### Stage 1: SFT (Supervised Fine-Tuning)
 
-Loss = cross-entropy on a discretized action head (7×256 uniform bins, matching OpenVLA) for the MiniCPM-o groups; OpenVLA keeps its native bins with MSE. AdamW (action head lr 1e-4 / LoRA lr 2e-5); up to 6 epochs with patience-1 early stopping on CALVIN SFT-val loss; bf16 with gradient checkpointing.
+Loss = cross-entropy on a discretized action head (7×256 uniform bins, matching OpenVLA) for both MiniCPM-o and OpenVLA groups (OpenVLA's native bin head is also trained with CE on its action tokens). AdamW (action head lr 1e-4 / LoRA lr 2e-5); 2 epochs with full-coverage chunked sampling (every frame seen each epoch) + patience-1 early stopping on CALVIN SFT-val loss; bf16 with gradient checkpointing.
 
 ### Stage 2: GRPO (Reinforcement-Learning Post-Training)
 
@@ -24,7 +24,7 @@ Roll out the policy in CALVIN → group-relative advantages → clipped policy l
 | Hyperparameter (locked across all groups) | Value |
 |---|---|
 | Group structure / clip ε / KL β | 4 groups × 4 trajectories / 0.2 / 0.05 |
-| Reward | R = R<sub>success</sub> + 0.5·R<sub>dist</sub> + 1.0·R<sub>collision</sub> + 0.1·R<sub>action</sub> |
+| Reward | R = R<sub>success</sub> + 0.5·R<sub>dist</sub> + 0.1·R<sub>action</sub> |
 | Total steps / evaluation | 20k env steps / deterministic eval every 200 episodes |
 | Backprop scope | LoRA + action head only |
 
