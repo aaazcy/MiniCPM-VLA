@@ -59,10 +59,12 @@ def main():
     policy.load_adapter(str(sft_ckpt))
     policy.to(args.device)
 
-    # frozen SFT reference for the GRPO KL penalty (never updated)
+    # frozen SFT reference for the GRPO KL penalty (never updated).
+    # Keep it on CPU: GRPOTrainer.update() does dual-phase offload
+    # (policy->cpu, reference->gpu, logp, reference->cpu, policy->gpu);
+    # loading both on one 32GB card OOMs (2x~19GB MiniCPM-o > 31.6GB).
     reference = build_model(cfg, stage="ref")
     reference.load_adapter(str(sft_ckpt))
-    reference.to(args.device)
     reference.eval()
 
     sampler = load_instruction_pools(cfg)
