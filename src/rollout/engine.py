@@ -40,6 +40,11 @@ class HFEngine(RolloutEngine):
         self.dtype = dtype
         self.image_size = image_size
         self.policy.eval()
+        # Gaussian exploration for GRPO rollouts (eval uses temperature=0 ->
+        # fully deterministic). WITHOUT this the MiniCPM-o MLP action head is
+        # deterministic, all 4 rollouts in a group are near-identical, the
+        # group-relative advantage collapses to ~0 and GRPO learns nothing.
+        self.rng = np.random.default_rng()
 
     @torch.no_grad()
     def act(self, obs, lang, audio_wav=None, temperature=1.0) -> np.ndarray:
@@ -52,7 +57,12 @@ class HFEngine(RolloutEngine):
 
         audio_l = [torch.from_numpy(audio_wav).float()] if audio_wav is not None else None
         out = self.policy.forward_sft(img_t, [lang], audio_l)
-        return out[0].detach().cpu().numpy().astype(np.float32)
+        action = out[0].detach().cpu().numpy().astype(np.float32)
+        if temperature > 0:
+            # stochastic rollout: add Gaussian noise (scaled by temperature)
+            action = action + self.rng.normal(0.0, 0.1 * temperature,
+                                              size=action.shape).astype(np.float32)
+        return np.clip(action, -1.0, 1.0).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
