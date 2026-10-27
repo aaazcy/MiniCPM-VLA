@@ -60,12 +60,13 @@ class GRPOTrainer:
     # ------------------------------------------------------------------ #
     # Rollout
     # ------------------------------------------------------------------ #
-    def rollout_one(self, instruction: str, temperature: float) -> Trajectory:
+    def rollout_one(self, instruction: str, temperature: float,
+                    task: Optional[str] = None) -> Trajectory:
         env = CalvinEnv(max_episode_steps=self.cfg.environment.max_episode_steps,
                         cameras=self.cfg.environment.cameras,
                         image_size=self.cfg.environment.image_size,
                         calvin_root=Path(self.cfg.dataset.calvin_root))
-        obs = env.reset(instruction)
+        obs = env.reset(instruction, task=task)
         traj = Trajectory()
         audio_wav = None
         if self.cfg.group.audio:
@@ -123,10 +124,10 @@ class GRPOTrainer:
         steps = []  # (img, lang, act, audio) flattened
         for traj in trajs:
             audio = traj.audio_wav          # raw wav (np.ndarray) or None
-            for obs, act in zip(traj.obs, traj.actions):
+            for obs, act, lp in zip(traj.obs, traj.actions, traj.step_logps):
                 img, lang = self._obs_to_tensor(obs)
                 steps.append((img, lang,
-                              torch.from_numpy(act).float().to(self.device), audio))
+                              torch.from_numpy(act).float().to(self.device), audio, lp))
 
         def _batch_logps(model, step_list, grad: bool) -> torch.Tensor:
             out = []
@@ -163,6 +164,7 @@ class GRPOTrainer:
             for tj in range(g.group_size):
                 a_flat.extend([A[gi, tj].item()] * traj_sizes[gi * g.group_size + tj])
         a_flat = torch.tensor(a_flat, device=self.device, dtype=torch.float32)
+        old = torch.tensor([s[4] for s in steps], device=self.device, dtype=torch.float32)
 
         pi_sum = 0.0
         n_steps = 0
@@ -183,7 +185,10 @@ class GRPOTrainer:
             ratio = torch.exp(pi - o)
             clipped = torch.clamp(ratio, 1 - g.clip_eps, 1 + g.clip_eps)
             policy_loss = -torch.min(ratio * a, clipped * a).mean()
-            kl = (r - pi).mean()
+            # KL(pi || ref) >= 0, estimated as mean(pi - ref); must be ADDED to the
+            # loss (penalize divergence). The old `(r - pi)` was negated -> it was
+            # *rewarding* divergence from the reference.
+            kl = (pi - r).mean()
             loss = policy_loss + g.beta_kl * kl
             loss.backward()          # graph freed immediately
             pi_sum += float(pi.detach().sum())
@@ -245,8 +250,9 @@ class GRPOTrainer:
             for _ in range(g.rollout_per_group):
                 group = []
                 for _ in range(g.group_size):
-                    instr = self.instruction_sampler.sample()
-                    traj = self.rollout_one(instr, temperature=self.cfg.rollout.temperature)
+                    instr, task = self.instruction_sampler.sample()
+                    traj = self.rollout_one(instr, temperature=self.cfg.rollout.temperature,
+                                            task=task)
                     group.append(traj)
                     self.env_steps += traj.length
                 groups.append(group)
@@ -274,8 +280,10 @@ class GRPOTrainer:
         eval_cfg = self.cfg.model_copy(deep=True)
         eval_cfg.eval.seeds = 1
         evaluator = Evaluator(eval_cfg, self.policy, engine=self.engine)
-        metrics = evaluator.evaluate_subset(self.instruction_sampler.sample_eval(n_episodes),
-                                            seeds=1, temperature=0.0)
+        pairs = self.instruction_sampler.sample_eval(n_episodes)
+        instrs = [p[0] for p in pairs]
+        tasks = [p[1] for p in pairs]
+        metrics = evaluator.evaluate_subset(instrs, seeds=1, temperature=0.0, tasks=tasks)
         return {f"grpo_eval/{k}": v for k, v in metrics.items()}
 
     # ------------------------------------------------------------------ #

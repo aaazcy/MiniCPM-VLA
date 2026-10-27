@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..utils.logger import Logger
@@ -90,15 +91,23 @@ class SFTTrainer:
             with torch.autocast(device_type="cuda" if self.device.startswith("cuda") else "cpu",
                                 dtype=torch.bfloat16, enabled=self.cfg.sft.bf16):
                 audio = batch.get("audio_wavs")
-                if hasattr(self.raw, "sft_loss") and not isinstance(
-                        self.model, torch.nn.parallel.DistributedDataParallel):
-                    out = self.raw.sft_loss(px, batch["langs"], audio, act)
-                    loss = out["loss"]
-                    mse = float(out["mse"]) if "mse" in out else float(loss.detach())
+                # Always go through self.model(...) so DDP's forward hooks fire.
+                # MiniCPM-o discrete head: forward now returns raw logits (B,7,num_bins)
+                # -> cross-entropy on quantized bins (same objective the old non-DDP
+                # sft_loss path used). OpenVLA native head / continuous head: forward
+                # returns the expected action -> MSE (unchanged behaviour).
+                out = self.model(px, batch["langs"], audio, act)
+                if getattr(self.raw, "action_head_type", None) == "discrete":
+                    logits = out
+                    q = self.raw.quantize(act.to(logits.device))
+                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                           q.reshape(-1))
+                    with torch.no_grad():
+                        mse = float(F.mse_loss(
+                            self.raw.expected_action(logits),
+                            act.to(logits.device)))
                 else:
-                    # call the module itself (not .forward_sft) so DDP's sync hooks run
-                    pred = self.model(px, batch["langs"], audio, act)
-                    loss = self.loss_fn(pred, act)
+                    loss = self.loss_fn(out, act)
                     mse = float(loss.detach())
             loss_val = float(loss.detach())
 

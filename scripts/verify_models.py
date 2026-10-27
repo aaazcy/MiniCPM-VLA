@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -62,12 +63,13 @@ def main():
     images = images.to(args.device)
     audio = [w.to(args.device) for w in audio] if audio else None
 
-    # --- path 1: SFT (teacher-forced) ---
+    # --- path 1: SFT (teacher-forced; CE for discrete heads) ---
     demo = torch.zeros(args.batch, 7, device=args.device)
-    out = model.forward_sft(images, langs, audio, actions=demo)
-    print(f"  SFT out: {tuple(out.shape)} range "
-          f"[{out.min().item():.3f}, {out.max().item():.3f}]")
-    loss = (out ** 2).mean()
+    out = model.sft_loss(images, langs, audio, demo)
+    loss = out["loss"]
+    n_bins = getattr(model, "num_bins", 256)
+    print(f"  SFT loss={out['loss'].item():.3f} mse={out['mse'].item():.3f} "
+          f"(discrete CE at init ~ ln(num_bins)={np.log(n_bins):.2f})")
     loss.backward()
     report(f"SFT bwd (batch={args.batch})")
     del loss, out

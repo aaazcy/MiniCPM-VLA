@@ -251,8 +251,19 @@ class MiniCPMoWrapper(nn.Module):
             logits = self.action_head(h)
             if actions is None:
                 return self.action_head.decode(logits, temperature=0.0)
-            return self.action_head.expected_action(logits)
+            # return the raw logits (B, 7, num_bins) so the trainer can compute
+            # cross-entropy on the quantized bins; returning expected_action here
+            # would silently degrade the discrete head to MSE regression.
+            return logits
         return self.action_head(h)
+
+    def quantize(self, actions: torch.Tensor) -> torch.Tensor:
+        """Public alias for the SFT trainer (natural bin indices)."""
+        return self.action_head.quantize(actions)
+
+    def expected_action(self, logits: torch.Tensor) -> torch.Tensor:
+        """E[action] under the bin distribution -> (B,7)."""
+        return self.action_head.expected_action(logits)
 
     def sft_loss(self, images: torch.Tensor, lang_texts: List[str],
                  audio_wavs: Optional[List], actions: torch.Tensor):

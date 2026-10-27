@@ -51,6 +51,7 @@ class OpenVLAWrapper(nn.Module):
         self.bin_centers = self.base.bin_centers          # (256,) uniform in [-1,1]
         self.num_bins = len(self.bin_centers)
         self.action_dim = 7
+        self.action_head_type = "discrete"  # native 256-bin head (CE target)
         try:
             self.base.gradient_checkpointing_enable()
         except Exception as e:
@@ -90,9 +91,39 @@ class OpenVLAWrapper(nn.Module):
         q = ((actions.clamp(-1, 1) + 1) / 2 * (self.num_bins - 1)).round().long()
         return q.clamp(0, self.num_bins - 1)
 
+    def quantize(self, actions: torch.Tensor) -> torch.Tensor:
+        """Public alias for the SFT trainer (natural bin indices)."""
+        return self._quantize(actions)
+
+    def expected_action(self, logits: torch.Tensor) -> torch.Tensor:
+        """E[action] under the (natural-order) bin distribution -> (B,7)."""
+        probs = torch.softmax(logits.float(), dim=-1)
+        centers = torch.from_numpy(np.asarray(self.bin_centers, dtype=np.float32)) \
+            .to(logits.device)
+        return (probs * centers).sum(-1)
+
     def _token_ids(self, actions: torch.Tensor) -> torch.Tensor:
         """bin indices -> vocabulary token ids (inverse of predict_action's decode)."""
         return self.vocab_size - self._quantize(actions) - 1
+
+    def _teacher_force_ids(self, inputs: dict, action_tokens: torch.Tensor):
+        """prompt (+ EMPTY_TOKEN if absent) + action tokens, with matching mask.
+
+        Matches OpenVLA's training-time convention (predict_action inserts the empty
+        token before generating). Without this, SFT/logp are computed on a different
+        input than the rollout's generate() path uses.
+        """
+        ids = inputs["input_ids"]
+        mask = inputs["attention_mask"]
+        if ids[0, -1].item() != EMPTY_TOKEN:
+            ids = torch.cat([ids, torch.full((ids.shape[0], 1), EMPTY_TOKEN,
+                                             dtype=ids.dtype, device=ids.device)], dim=1)
+            mask = torch.cat([mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype,
+                                               device=mask.device)], dim=1)
+        ids = torch.cat([ids, action_tokens], dim=1)
+        mask = torch.cat([mask, torch.ones(action_tokens.shape, dtype=mask.dtype,
+                                           device=action_tokens.device)], dim=1)
+        return ids, mask
 
     def _prep_inputs(self, images: torch.Tensor, lang_texts: List[str]):
         from PIL import Image
@@ -113,10 +144,17 @@ class OpenVLAWrapper(nn.Module):
         out = self.base(input_ids=ids, attention_mask=mask,
                         pixel_values=inputs["pixel_values"],
                         output_hidden_states=True)
-        hs = out.hidden_states[-1][:, -n_pos:, :]              # (B, n_pos, H)
+        # Causal LM: hidden_state[p] predicts token[p+1]. The 7 action tokens are
+        # appended at the END of `ids` (positions T..T+6), so the hidden states that
+        # PREDICT them are positions T-1..T+5 = [-n_pos-1 : -1] (NOT [-n_pos:], which
+        # are the positions AT the action tokens and predict one step past them).
+        hs = out.hidden_states[-1][:, -n_pos - 1:-1, :]      # (B, n_pos, H)
         lm_head = getattr(self.llm, "lm_head", None) or self.llm.base_model.model.lm_head
         logits_full = lm_head(hs)                               # (B, n_pos, V)
-        return logits_full[:, :, -self.num_bins:]               # (B, n_pos, 256)
+        # The last num_bins vocab columns hold the action tokens in REVERSED bin
+        # order (token vocab_size-1 == bin 0 == -1). Flip so slice index j == bin j,
+        # matching bin_centers[j] and _quantize's output.
+        return logits_full[:, :, -self.num_bins:].flip(-1)      # (B, n_pos, num_bins)
 
     def forward(self, images: torch.Tensor, lang_texts: List[str],
                 audio_wavs: Optional[List] = None,
@@ -130,29 +168,29 @@ class OpenVLAWrapper(nn.Module):
                     temperature: float = 1.0) -> torch.Tensor:
         """Predicted 7-D action in [-1,1].
 
-        With `actions` (SFT): teacher-forced native-head logits (B,7,256) -> expected
-        action = softmax(logits) @ bin_centers. Without (rollout/eval): autoregressive
-        generation through the native head (temperature=0 -> greedy/deterministic).
+        With `actions` (SFT): returns teacher-forced native-head logits
+        (B,7,num_bins) in natural bin order; the trainer computes cross-entropy
+        on the quantized bins. Without (rollout/eval): autoregressive generation
+        through the native head (temperature=0 -> greedy/deterministic).
         """
         if actions is None:
             return self._generate_action(images, lang_texts, temperature)
 
         inputs = self._prep_inputs(images, lang_texts)
         tok = self._token_ids(actions.to(images.device))
-        ids = torch.cat([inputs["input_ids"], tok], dim=1)
-        mask = torch.cat([inputs["attention_mask"], torch.ones_like(tok)], dim=1)
-        logits = self._head_logits(inputs, ids, mask, self.action_dim)  # (B,7,256)
-        probs = torch.softmax(logits, dim=-1)
-        centers = torch.from_numpy(np.asarray(self.bin_centers, dtype=np.float32)) \
-            .to(logits.device)
-        return (probs * centers).sum(-1)  # (B,7)
+        ids, mask = self._teacher_force_ids(inputs, tok)
+        logits = self._head_logits(inputs, ids, mask, self.action_dim)  # (B,7,num_bins)
+        return logits  # trainer computes cross-entropy on the quantized bins
 
     def sft_loss(self, images: torch.Tensor, lang_texts: List[str],
                  audio_wavs: Optional[List], actions: torch.Tensor):
-        """OpenVLA SFT objective: MSE on the expected action (native bins)."""
-        pred = self.forward_sft(images, lang_texts, audio_wavs, actions)
-        loss = F.mse_loss(pred, actions.to(pred.device))
-        return {"loss": loss, "mse": loss.detach()}
+        """OpenVLA SFT objective: cross-entropy on the discretized action bins."""
+        logits = self.forward_sft(images, lang_texts, audio_wavs, actions)
+        q = self._quantize(actions.to(logits.device))
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), q.reshape(-1))
+        with torch.no_grad():
+            mse = F.mse_loss(self.expected_action(logits), actions.to(logits.device))
+        return {"loss": loss, "mse": mse.detach()}
 
     @torch.no_grad()
     def _generate_action(self, images: torch.Tensor, lang_texts: List[str],
@@ -179,8 +217,7 @@ class OpenVLAWrapper(nn.Module):
         """Categorical logp of the quantized actions under the native head (GRPO)."""
         inputs = self._prep_inputs(images, lang_texts)
         tok = self._token_ids(actions.to(images.device))
-        ids = torch.cat([inputs["input_ids"], tok], dim=1)
-        mask = torch.cat([inputs["attention_mask"], torch.ones_like(tok)], dim=1)
+        ids, mask = self._teacher_force_ids(inputs, tok)
         logits = self._head_logits(inputs, ids, mask, self.action_dim)  # (B,7,256)
         logp = torch.log_softmax(logits, dim=-1)
         q = self._quantize(actions.to(images.device))
@@ -207,9 +244,12 @@ class OpenVLAWrapper(nn.Module):
         action = torch.from_numpy(self.bin_centers[bins]).float().unsqueeze(0) \
             .to(images.device)
         # logp under the sampling distribution (same temperature as generate)
-        tok2 = tokens.unsqueeze(0)
-        ids2 = torch.cat([inputs["input_ids"], tok2], dim=1)
-        mask2 = torch.cat([inputs["attention_mask"], torch.ones_like(tok2)], dim=1)
+        # Re-encode the DECODED action (not the raw generated tokens): when the model
+        # emits a non-action token, `tokens` != `_token_ids(action)`, and using `tokens`
+        # here makes `logp_old` inconsistent with `logp_actions` (which re-encodes from
+        # the float action). That mismatch explodes the GRPO ratio exp(pi - old).
+        tok2 = self._token_ids(action)
+        ids2, mask2 = self._teacher_force_ids(inputs, tok2)
         logits = self._head_logits(inputs, ids2, mask2, self.action_dim)
         logp = torch.log_softmax(logits / max(temperature, 1e-6), dim=-1)
         q = torch.from_numpy(bins).long().to(images.device).unsqueeze(0)
