@@ -73,18 +73,25 @@ def fetch_one(url: str, name: str, meta: dict, out_dir: Path, retries: int = 6) 
         return dst  # already downloaded
 
     loffset = meta["offset"]
+    csize = meta["csize"]
     last_err = None
     for attempt in range(retries):
         try:
-            # parse the LOCAL file header to locate the data start
-            lh = http_range(url, loffset, loffset + 29)
-            if unpack_exact("<I", lh[0:4])[0] != 0x04034B50:
+            # ONE HTTP Range request covering the local header + compressed data.
+            # The header is 30 + nlen + elen bytes; CALVIN filenames are short so
+            # 512 bytes of headroom is more than enough. Halves the round-trips vs
+            # the previous header-then-data two-request flow.
+            head_guess = 512
+            buf = http_range(url, loffset, loffset + 30 + head_guess + csize - 1)
+            if unpack_exact("<I", buf[0:4])[0] != 0x04034B50:
                 raise RuntimeError(f"bad local header for {name}")
-            nlen, elen = unpack_exact("<HH", lh[26:30])
-            data_start = loffset + 30 + nlen + elen
-            data = http_range(url, data_start, data_start + meta["csize"] - 1)
-            if len(data) != meta["csize"]:
-                raise RuntimeError(f"short read {len(data)}/{meta['csize']}")
+            nlen, elen = unpack_exact("<HH", buf[26:30])
+            header_len = 30 + nlen + elen
+            if header_len > 30 + head_guess:
+                raise RuntimeError(f"header too long for {name}: {header_len}")
+            data = buf[header_len:header_len + csize]
+            if len(data) != csize:
+                raise RuntimeError(f"short read {len(data)}/{csize}")
             if meta.get("method") == 8:      # deflate-compressed in the outer zip
                 data = zlib.decompress(data, -15)  # raw deflate
             if len(data) != expected:

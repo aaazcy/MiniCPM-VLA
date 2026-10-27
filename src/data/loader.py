@@ -143,9 +143,10 @@ class BridgeDataset(Dataset):
 def build_sft_loaders(cfg, processor, split: str, batch_size: int, num_workers: int = 8):
     """Build train/val DataLoaders for SFT. split in {"sft_train","sft_val"}.
 
-    Training: one whole CALVIN trajectory per item; the collate samples a random
-    `steps_per_traj`-long chunk per epoch (bounded memory, multiple epochs cover
-    the trajectory). Bridge is added only if "bridge" is in cfg.group.dataset.
+    Training: CALVIN trajectories are pre-chunked into `steps_per_traj`-long items
+    so every frame is seen each epoch (full coverage) while per-forward memory stays
+    at batch_size x steps_per_traj samples. Bridge is added only if "bridge" is in
+    cfg.group.dataset.
 
     Validation: CALVIN trajectories are pre-chunked (val_chunk_size) so early
     stopping sees every frame, not just the first few.
@@ -188,7 +189,12 @@ def build_sft_loaders(cfg, processor, split: str, batch_size: int, num_workers: 
         ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split,
                                  chunk_size=val_chunk_size)]
     else:
-        ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split)]
+        # full-coverage chunking: each trajectory is split into steps_per_traj-long
+        # chunks; one chunk per batch => every frame is seen each epoch, while the
+        # per-forward memory stays at batch_size x steps_per_traj samples. Bridge
+        # (if requested) stays whole and is sliced by the collate.
+        ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split,
+                                 chunk_size=steps_per_traj)]
         if "bridge" in cfg.group.dataset:
             ds_list.append(BridgeDataset(Path(cfg.dataset.bridge_root), split))
     ds = torch.utils.data.ConcatDataset(ds_list)

@@ -53,6 +53,10 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=None, help="override sft.max_epochs")
     ap.add_argument("--batch-size", type=int, default=None, help="override sft.batch_size")
+    ap.add_argument("--patience", type=int, default=None, help="override sft.early_stop_patience")
+    ap.add_argument("--init-from", default=None,
+                    help="warm-start: load LoRA+action head from this ckpt dir "
+                         "(e.g. B2 SFT) before training (B3 text-warm-started speech SFT)")
     ap.add_argument("--smoke", type=int, default=0,
                     help="run only N training batches (pipeline validation)")
     args = ap.parse_args()
@@ -63,6 +67,8 @@ def main():
         cfg.sft.max_epochs = args.epochs
     if args.batch_size is not None:
         cfg.sft.batch_size = args.batch_size
+    if args.patience is not None:
+        cfg.sft.early_stop_patience = args.patience
     torch.manual_seed(cfg.experiment.seed)
     np.random.seed(cfg.experiment.seed)
     random.seed(cfg.experiment.seed)
@@ -101,7 +107,7 @@ def main():
             return csi_collate
 
         train_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
-                              "sft_train", chunk_size=None)
+                              "sft_train", chunk_size=steps_per_traj)
         val_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
                             "sft_val", chunk_size=val_chunk_size)
         train_loader = DataLoader(train_ds, batch_size=cfg.sft.batch_size, shuffle=True,
@@ -119,6 +125,17 @@ def main():
                                        args.num_workers)
 
     model = build_model(cfg, stage="sft")
+    if args.init_from:
+        from src.utils.ckpt import head_compatible
+        init = Path(args.init_from)
+        if not (init / "trainer_state.pt").exists():
+            raise FileNotFoundError(f"init-from checkpoint missing at {init}")
+        if not head_compatible(init, cfg):
+            raise SystemExit(f"init-from ckpt {init} action-head config does not "
+                             f"match current cfg ({cfg.model.action_head})")
+        model.load_adapter(str(init))
+        log_ = logging.getLogger(__name__)
+        log_.info("[SFT] warm-started from %s", init)
     rank, world = _ddp_setup()
     if rank is not None:
         device = f"cuda:{rank}"
@@ -139,6 +156,13 @@ def main():
     trainer = SFTTrainer(model, cfg, device=device, is_main=(rank in (None, 0)))
 
     resume = resolve_resume(args.resume, cfg.sft_ckpt_dir, "sft")
+    if resume is not None and rank in (None, 0):
+        from src.utils.ckpt import head_compatible
+        if not head_compatible(resume, cfg):
+            raise SystemExit(
+                f"resume checkpoint {resume} uses a different action-head config "
+                f"than the current one ({cfg.model.action_head}); start fresh "
+                f"instead of resuming.")
     best_ckpt = trainer.train(train_loader, val_loader, logger, resume_from=resume,
                               smoke_steps=args.smoke)
     if rank in (None, 0):
