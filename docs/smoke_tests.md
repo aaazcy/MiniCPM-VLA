@@ -51,8 +51,11 @@ python scripts/smoke_grpo.py --group b2 --device cuda:2
 | 9B 显存不足 | sdpa + grad ckpt + batch 1 |
 | PeftModel `.model.embed_tokens` 失效 | Qwen3ForCausalLM 注册别名 |
 | 动作头 fp32 × LLM bf16 | ActionHead 输入 cast |
+| 连续动作头均值坍缩(B0/B1/B2 SFT loss 停在 ~0.145) | 改用离散 7×256-bin 头 + CE(对齐 OpenVLA) |
+| B3 collate 整条 65 帧塞一次 forward OOM | 改分块(chunk_size)+ val 全帧分块 |
 
 ## 4. 结果记录(截至 2026-10-27)
 
-- [x] A0 SFT / A1 SFT / B0 模型 / B2 模型
-- [ ] A1 GRPO、B1 模型、B2 SFT/GRPO、B3 模型/SFT/GRPO
+- [x] A0 SFT / A1 SFT / B0 模型 / B2 模型(初始)
+- [x] 离散头 + CALVIN-only 重构后:A0 SFT smoke、B2 模型 verify(fwd/bwd/logp/generate)、B2 SFT smoke(CE 5.52→4.87 下降)
+- [ ] A1 GRPO、B1 模型、B2/B3 SFT/GRPO、B3 模型(等 stride-12 数据预处理完成后重跑)

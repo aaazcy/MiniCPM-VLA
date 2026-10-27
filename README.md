@@ -6,7 +6,7 @@ Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipul
 
 ## Highlights
 
-- **Omnimodal VLA**: image + text + speech (Whisper audio tower) inputs → 7-DoF continuous action output (end-effector pose + gripper, [−1,1])
+- **Omnimodal VLA**: image + text + speech (Whisper audio tower) inputs → 7-DoF action output (end-effector pose + gripper, [−1,1]); MiniCPM-o uses a discretized 256-bin action head (same parameterization as OpenVLA)
 - **Two-stage post-training**: SFT (MSE behavior cloning) → GRPO (group-relative policy optimization with KL constraint)
 - **Parameter-efficient**: only LoRA adapters and the action head are trained — fits a single 32 GB GPU; policy/reference models swapped via dual-phase offload
 - **Rigorous comparisons**: 6 experiment groups + a 2×2 cross-modal speech/text evaluation matrix; leak-guarded splits (sha256 manifests)
@@ -15,7 +15,7 @@ Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipul
 
 ### Stage 1: SFT (Supervised Fine-Tuning)
 
-Loss = MSE(predicted action, demonstrated action). AdamW (action head lr 1e-4 / LoRA lr 2e-5); 2 epochs with patience-1 early stopping; bf16 with gradient checkpointing.
+Loss = cross-entropy on a discretized action head (7×256 uniform bins, matching OpenVLA) for the MiniCPM-o groups; OpenVLA keeps its native bins with MSE. AdamW (action head lr 1e-4 / LoRA lr 2e-5); up to 6 epochs with patience-1 early stopping on CALVIN SFT-val loss; bf16 with gradient checkpointing.
 
 ### Stage 2: GRPO (Reinforcement-Learning Post-Training)
 
@@ -92,7 +92,7 @@ docs/              # experiment plan, smoke matrix, data pipeline, limitations
 
 - torch 2.5.1+cu124, transformers (hf-mirror)
 - 3×32 GB vGPUs; HF engine only (no vLLM dependency)
-- CALVIN env-A windows + Bridge V2 (1,995 episodes); B3 uses CSI (synthesized TTS speech)
+- CALVIN env-A 64-step language windows (stride-12 subsample, ~500 windows); B3 uses CSI (synthesized TTS speech). BridgeData V2 is **not** part of the main comparison (CALVIN-only).
 
 ## References
 

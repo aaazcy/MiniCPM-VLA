@@ -6,9 +6,9 @@
 
 | 数据源 | 原始规模 | 获取方式 | 最终规模 |
 |---|---|---|---|
-| CALVIN(task_ABC_D) | 官方 zip **517 GB**(1,894,126 个 step 文件) | **远程选择性抽取**(HTTP Range,不整包下载) | 环境 A:127 训练窗口 + 34 验证窗口(≈2.5 GB 原始步) |
-| BridgeData V2 | 60,096 轨迹(官方原始 ~62GB+) | HF 镜像流式拉取(LeRobot 格式) | 2,000 段随机子采样 |
-| CSI 语音(B3) | 复用 CALVIN 轨迹 | 本地 TTS 合成(edge-tts) | 107 条 16 kHz wav |
+| CALVIN(task_ABC_D) | 官方 zip **517 GB**(1,894,126 个 step 文件) | **远程选择性抽取**(HTTP Range,不整包下载) | 环境 A:**~500 训练窗口**(stride 12)+ 34 验证窗口(≈9 GB 原始步) |
+| BridgeData V2 | 60,096 轨迹(官方原始 ~62GB+) | HF 镜像流式拉取(LeRobot 格式) | **已从主实验移除**(仅保留 loader 支持,可选消融) |
+| CSI 语音(B3) | 复用 CALVIN 轨迹 | 本地 TTS 合成(edge-tts) | 16 kHz wav(按新窗口指令补全) |
 | 鲁棒指令集 | CALVIN 官方自带改写标注 | 从 zip 抽取 `lang_paraphrase-MiniLM-L3-v2` | 34 条改写指令 |
 
 ## 1. 关键事实(实测验证,写代码前必读)
@@ -53,12 +53,14 @@ python scripts/selective_extract.py --index data/calvin/meta.index.json --all \
     --out-dir data/calvin/meta
 cp data/calvin/meta/training/scene_info.npy data/calvin/meta/task_ABC_D/training/  # 修复包
 
-# ③ 窗口级抽样计划(环境 A 内,64 步窗口 stride=48)
+# ③ 窗口级抽样计划(环境 A 内,64 步窗口 stride=12)
 python scripts/plan_calvin_subset.py \
     --training-meta data/calvin/meta/task_ABC_D/training \
     --validation-meta data/calvin/meta/task_ABC_D/validation \
-    --env A --train-window-stride 48 --val-window-stride 32
-#   → plan.json: 127 训练窗口 / 34 验证窗口(step id 列表)
+    --env A --train-window-stride 12 --val-window-stride 32
+#   → plan.json: ~500 训练窗口 / 34 验证窗口(step id 列表)
+#   一键扩展(改 stride 后下载缺失 step + 预处理,续传安全):
+#   python scripts/extend_calvin_data.py --stride 12 [--skip-preprocess]
 
 # ④ 抽取所选 step 文件(断点续传、跳过已存在、deflate 解压+大小校验)
 python scripts/query_zip_index.py --index data/calvin/task_ABC_D.index.json \
@@ -93,10 +95,12 @@ python scripts/preprocess_data.py --dataset calvin \
 - 启发式过滤(抓手停滞/抖动)**默认关闭**:CALVIN 遥操作数据天然含"移动中抓手静止"
   等模式,原启发式会误砍 66% 数据;全组数据一致,过滤非必需。
 
-### 3.2 Bridge V2(经 hf-mirror)
+### 3.2 Bridge V2(经 hf-mirror)—— 已从主实验移除,可选消融
 ```bash
 python scripts/preprocess_bridge_remote.py --max-trajectories 2000 --workers 8
 ```
+> **注意**:主实验已改为 **CALVIN-only**(`group.dataset: [calvin]`)。Bridge 只作为
+> 可选消融保留,`src/data/loader.py` 仅在 `group.dataset` 含 `"bridge"` 时才加载。
 - 源:`IPEC-COMMUNITY/bridge_orig_lerobot`(LeRobot 格式镜像;huggingface.co 直连
   不可达,统一走 `https://hf-mirror.com/.../resolve/main/...`)
 - 每 episode:下载 parquet(动作/状态)+ `image_0` mp4 → av 解码逐帧 resize →
@@ -130,20 +134,20 @@ python scripts/make_robust_set.py \
 - `sft_train ∩ sft_val = ∅`,`id_test ∩ (sft_train ∪ sft_val) = ∅`
 - 加载器每次实例化时重新校验;违反即抛异常
 
-最终清单:
+最终清单(CALVIN-only):
 ```
-calvin_sft_train(107)  calvin_sft_val(20)  calvin_id_test(34)
-bridge_train(2000)     robust_instructions(34)
+calvin_sft_train(~416)  calvin_sft_val(~76)  calvin_grpo_eval(16)  calvin_id_test(34)
+robust_instructions(34)
 ```
 
 ## 5. 最终数据集规模
 
 | 部分 | 大小 | 说明 |
 |---|---|---|
-| CALVIN 轨迹(161 段) | ~0.7 GB | 224px 压缩 npz |
-| Bridge 轨迹(2000 段) | ~2-3 GB | 完成后 |
+| CALVIN 轨迹(~540 段) | ~2.2 GB | 224px 压缩 npz(stride 12) |
 | CSI 语音 | ~50 MB | 16kHz wav + 分段 |
 | 元数据/索引/计划 | ~0.25 GB | 保留以便复现 |
+| 原始 step 文件 | ~9 GB | 环境 A stride-12 窗口所需,预处理后可删 |
 
 ## 6. 已知坑(踩过,勿再犯)
 

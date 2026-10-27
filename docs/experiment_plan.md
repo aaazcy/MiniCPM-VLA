@@ -70,9 +70,13 @@ RL), and what does synchronized synthesized speech (B3) add?
 ## 2. Locked protocol (identical for all groups)
 
 - **Action space**: 7-D continuous `[dx,dy,dz,rx,ry,rz,gripper]` ∈ [-1,1]
+- **Action head**: MiniCPM-o groups use a discretized 7×256-bin head (cross-entropy),
+  matching OpenVLA's native bins. This replaces the continuous MLP head that collapsed
+  to the dataset mean in the first smoke runs.
 - **Env**: CALVIN (Franka, long-horizon chains), max 100 steps/episode, single static cam 224×224
-- **SFT**: MSE; AdamW; lr head=1e-4, LoRA=2e-5; batch 8; wd 1e-4; grad ckpt; early stop on
-  SFT-val MSE (val never used in RL)
+- **SFT**: discrete-head CE (MiniCPM-o) / native-bin MSE (OpenVLA); AdamW; lr head=1e-4,
+  LoRA=2e-5; batch 1 traj × 4 steps; wd 1e-4; grad ckpt; early stop on SFT-val loss
+  (val never used in RL)
 - **GRPO**: group_size=4, rollout_per_group=4, clip_eps=0.2, beta_kl=0.05; lr head=1e-4,
   LoRA=2e-5; max_grad_norm=1.0; group-relative advantage (no critic); KL vs frozen SFT
   reference; deterministic eval (temp=0) every 200 episodes + checkpoint
@@ -91,10 +95,13 @@ RL), and what does synchronized synthesized speech (B3) add?
   [1191339, 1795044]). Language is annotated per 64-step window. **No testing split**
   in task_ABC_D.zip → OOD follows the official ABC→D protocol: validation episodes
   rendered with `calvin_scene_D`.
-- **SFT subset**: 127 env-A windows / 7,720 steps (~2.0 GB download), window-level
-  stride 48 across all env-A episodes. 85/15 train/SFT-val.
+- **SFT subset (CALVIN-only)**: ~500 env-A windows / ~32k steps, window-level stride 12
+  across all env-A episodes (6,089 windows). 85/15 train/SFT-val, then a 16-window
+  GRPO-eval pool is carved out of train (id_test stays locked).
 - **ID/OOD test**: 34 validation windows / 1,982 steps (~0.5 GB).
-- **Bridge V2**: ≤2000 trajectories via HF streaming (same seed for all groups).
+- **Bridge V2**: **removed from the main comparison** — CALVIN-only for all groups.
+  The loader still supports `dataset: [calvin, bridge]` as an optional ablation, but no
+  group config uses it.
 - **Actions**: CALVIN `rel_actions` are ALREADY normalized to [-1,1] (pos factor 50,
   rot factor 20, gripper ±1) and the env consumes them directly — no rescaling.
 - **B3**: same CALVIN windows + synthesized 16 kHz TTS wav (edge-tts → espeak-ng),
@@ -105,8 +112,8 @@ RL), and what does synchronized synthesized speech (B3) add?
 
 | Knob | Original spec | Minimal | Rationale |
 |---|---|---|---|
-| CALVIN SFT data | calvin_A split (603k steps) | 127 windows / 7.7k steps | LoRA few-demo scale; controlled comparison needs consistency, not volume |
-| Bridge | 20k+ trajs | 2k trajs | embodiment diversity with ~1/10 cost |
+| CALVIN SFT data | calvin_A split (603k steps) | ~500 windows / ~32k steps | LoRA few-demo scale; controlled comparison needs consistency, not volume |
+| Bridge | 20k+ trajs | **0 (removed)** | CALVIN-only main experiment; Bridge optional ablation only |
 | SFT epochs | 20 | 6 (+early stop) | LoRA converges fast on small data |
 | GRPO env steps | 400k | **40k** | ~60 GRPO updates — enough for a stable trend at 16 trajs/update |
 | Rollout episode cap | 100 | 60 | shorter rollouts, same action space |
@@ -126,8 +133,8 @@ mounting the GPU (the limit is expected to follow the instance spec).
 ### Phase 0 — 数据与代码(✅ 全部完成)
 - [x] Full codebase: configs, SFT/GRPO trainers, rollouts (HF engine), evaluator, plotting
 - [x] 19 CPU smoke checks green; pydantic-locked hyperparameters; leak-guarded splits
-- [x] CALVIN env-A 窗口抽取与预处理:91 sft_train + 16 grpo_eval + 20 sft_val + 34 id_test
-- [x] Bridge V2 1,995 段;CSI 语音 107 条;鲁棒指令 34 条
+- [x] CALVIN env-A 窗口抽取与预处理:stride 48→12(~500 窗口;~416 sft_train + ~76 sft_val + 16 grpo_eval + 34 id_test)
+- [x] Bridge V2 从主实验移除(loader 仍保留支持);CSI 语音;鲁棒指令 34 条
 - [x] 模型本地化:OpenVLA-7B(15G)+ MiniCPM-o-4_5(19G)
 - [x] Git 基建:独立仓库 + 自动提交守护进程 + `/commit` 命令 + commit-writer agent + skill
 

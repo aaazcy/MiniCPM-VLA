@@ -17,20 +17,21 @@
    are stochastic; we report mean ± std over 20 seeded repeats, but cross-run variance
    remains.
 
-5. **Trajectory filtering is heuristic.** "Bad collision/failure" filtering uses
-   heuristics (gripper motionless over long windows, jitter spikes). It is not
-   human-labeled.
+5. **Trajectory filtering is heuristic.** The "bad collision/failure" filter is
+   disabled by default (the original stall/jitter heuristics rejected most CALVIN
+   teleop windows). If manual curation (collision/failure labels) becomes available it
+   can be re-enabled in `preprocess_data.py`; it is not human-labeled.
 
 6. **Single-view input.** Only the CALVIN static camera is used (224×224) so both models
    see identical input; the gripper camera and proprio are dropped. OpenVLA's native head
    normally receives proprio — dropping it slightly handicaps A groups; deliberate
    controlled-comparison choice, disclosed here.
 
-7. **Post-training data scale.** The CALVIN env-A training subset is ~200–300 episodes
-   (a few percent of the full 517 GB dataset) and Bridge is a ≤5 k streaming subsample.
-   Results are about the *post-training comparison* between paradigms under identical
-   data, not full-scale VLA performance. Absolute success rates should not be compared
-   to papers trained on the full dataset.
+7. **Post-training data scale.** The CALVIN env-A training subset is ~500 64-step
+   language windows (stride 12, a few percent of the full 517 GB dataset). BridgeData V2
+   is **not** used in the main comparison. Results are about the *post-training
+   comparison* between paradigms under identical data, not full-scale VLA performance.
+   Absolute success rates should not be compared to papers trained on the full dataset.
 
 8. **"calvin_A" identification.** There is no published A-only zip; env-A episodes are
    identified via the official `scene_info.npy` step ranges (`A = [1191339, 1795044]`,
