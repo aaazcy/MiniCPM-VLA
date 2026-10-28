@@ -220,7 +220,8 @@ class OpenVLAWrapper(nn.Module):
             # constant/garbage action (this was the action-collapse root cause)
             mask = torch.cat([mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype,
                                                device=mask.device)], dim=1)
-        gen_kwargs = dict(attention_mask=mask, max_new_tokens=7)
+        gen_kwargs = dict(attention_mask=mask, pixel_values=inputs["pixel_values"],
+                          max_new_tokens=7)
         if temperature > 0:
             gen_kwargs.update(do_sample=True, temperature=temperature)
         else:
@@ -257,7 +258,8 @@ class OpenVLAWrapper(nn.Module):
             # _generate_action; a length-T mask over T+1 tokens collapses the action)
             mask = torch.cat([mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype,
                                                device=mask.device)], dim=1)
-        gen_kwargs = dict(attention_mask=mask, max_new_tokens=7)
+        gen_kwargs = dict(attention_mask=mask, pixel_values=inputs["pixel_values"],
+                          max_new_tokens=7)
         if temperature > 0:
             gen_kwargs.update(do_sample=True, temperature=temperature)
         else:
