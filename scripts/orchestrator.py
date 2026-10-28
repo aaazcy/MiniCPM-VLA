@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Autonomous training orchestrator.
+"""Full-pipeline orchestrator for the 3-arm experiment (A / B2 / B3).
 
-Watches for new per-epoch SFT checkpoints (runs/<G>/sft/epoch_N, created by the
-snapshot watcher) and immediately launches a full ID evaluation for each on an idle
-GPU. Keeps GPUs busy, never batches evaluations, and persists its state so it can be
-restarted safely. Also reports when SFT finishes (so GRPO can be started).
+Sequence (strict, restart-safe via runs/orchestrator_state.json):
+  1. Wait for A1 SFT (already running, 3-card DDP, 4 epochs) to finish.
+  2. A1 best ID eval  -> 3-card shard, merge, report.
+  3. B2 SFT (fresh, 3-card DDP, 4 epochs).
+  4. B2 best ID eval  -> 3-card shard, merge, report.
+  5. B2 GRPO (3-card rollout-parallel).
+
+Only the LOWEST-VAL-LOSS checkpoint (sft/best) is evaluated — no per-epoch
+evaluation. Each eval is sharded across all 3 GPUs so none sit idle.
 """
 from __future__ import annotations
 
@@ -15,18 +20,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / "runs" / "orchestrator_state.json"
-GROUPS = ["B2", "A1"]
-MODEL_NEED_GB = 26  # a free GPU must have at least this much free (GiB)
-
-
-def gpu_free_gib(gpu_id: int) -> float:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"]
-        ).decode().strip().split("\n")
-        return int(out[gpu_id]) / 1024.0
-    except Exception:
-        return 0.0
+ENV = (
+    "export PATH=/root/miniconda3/bin:$PATH "
+    "export HF_ENDPOINT=https://hf-mirror.com "
+    "export PYOPENGL_PLATFORM=egl "
+    "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+    "export TOKENIZERS_PARALLELISM=false "
+)
+PY = "/root/miniconda3/bin/python"
 
 
 def load_state() -> dict:
@@ -42,59 +43,188 @@ def save_state(state: dict) -> None:
     STATE.write_text(json.dumps(state, indent=2))
 
 
+def pgrep_running(pattern: str) -> bool:
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+    return r.returncode == 0
+
+
+def log_done(procs: dict) -> None:
+    for tag, p in list(procs.items()):
+        if p.poll() is not None:
+            print(f"[orch] done: {tag} (rc={p.returncode})", flush=True)
+            del procs[tag]
+
+
+def launch(cmd: str, logfile: Path):
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    with open(logfile, "w") as f:
+        return subprocess.Popen(cmd, shell=True, stdout=f, stderr=subprocess.STDOUT)
+
+
+def sft_cmd(group: str, epochs: int) -> str:
+    return (f"cd {ROOT} && {ENV} "
+            f"torchrun --nproc_per_node=3 scripts/train_sft.py "
+            f"--group {group} --epochs {epochs}")
+
+
+def eval_cmd(group: str, ckpt: str, gpu: int, k: int, n: int) -> str:
+    return (f"cd {ROOT} && {ENV} "
+            f"{PY} -u scripts/evaluate.py --group {group} --split id "
+            f"--ckpt {ckpt} --device cuda:{gpu} --shard {k} {n}")
+
+
+def grpo_cmd(group: str) -> str:
+    return (f"cd {ROOT} && {ENV} "
+            f"torchrun --nproc_per_node=3 scripts/train_grpo_dist.py --group {group}")
+
+
+def merge_shards(run_dir: Path, split: str = "id", modality: str = "native",
+                 n_shards: int = 3):
+    acc, wsum, total = {}, {}, 0
+    for k in range(n_shards):
+        f = run_dir / f"eval_{split}_{modality}_shard{k}of{n_shards}.json"
+        if not f.exists():
+            return None
+        d = json.loads(f.read_text())
+        n = d.get("n_instructions", 0)
+        total += n
+        for key, val in d.get("metrics", {}).items():
+            if not isinstance(val, (int, float)):
+                continue
+            acc[key] = acc.get(key, 0.0) + val * n
+            wsum[key] = wsum.get(key, 0.0) + n
+    merged = {k: acc[k] / wsum[k] for k in acc}
+    merged["n_instructions"] = total
+    out = run_dir / f"eval_{split}_{modality}_merged.json"
+    out.write_text(json.dumps({"merged": merged}, indent=2))
+    return merged
+
+
+def wait_sft_done(group_id: str, logfile: Path) -> None:
+    """Block until the SFT process for group_id is gone AND its log says done."""
+    while True:
+        if (not pgrep_running(f"train_sft.py --group {group_id}")
+                and logfile.exists()
+                and "SFT done" in logfile.read_text()):
+            return
+        time.sleep(30)
+
+
 def main():
     state = load_state()
-    state.setdefault("launched", [])   # list of keys already launched
-    active = {}                        # gpu_id -> (key, Popen)
+    state.setdefault("stage", "a1_sft")
+    state.setdefault("procs", {})
 
     while True:
-        # reap finished evals
-        for gpu, (key, p) in list(active.items()):
-            if p.poll() is not None:
-                print(f"[orch] done: {key} (rc={p.returncode})", flush=True)
-                del active[gpu]
+        stage = state["stage"]
 
-        # find new epoch checkpoints
-        for g in GROUPS:
-            sft_dir = ROOT / "runs" / g / "sft"
-            if not sft_dir.exists():
-                continue
-            for p in sorted(sft_dir.glob("epoch_*")):
-                if not (p / "trainer_state.pt").exists():
-                    continue
-                epoch = int(p.name.split("_")[1])
-                key = f"{g}_id_epoch{epoch}"
-                if key in state["launched"] or any(k == key for k, _ in active.values()):
-                    continue
-                # find an idle GPU (not running an eval) with enough free memory
-                gpu = None
-                for i in range(3):
-                    if i in active:
-                        continue
-                    if gpu_free_gib(i) >= MODEL_NEED_GB:
-                        gpu = i
-                        break
-                if gpu is None:
-                    print(f"[orch] no free GPU for {key}; will retry", flush=True)
-                    break
-                log = ROOT / "runs" / f"eval_{g}_id_epoch{epoch}.log"
-                cmd = (
-                    f"cd {ROOT} && export PATH=/root/miniconda3/bin:$PATH "
-                    f"export PYOPENGL_PLATFORM=egl "
-                    f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-                    f"export TOKENIZERS_PARALLELISM=false && "
-                    f"/root/miniconda3/bin/python -u scripts/evaluate.py "
-                    f"--group {g.lower()} --split id --ckpt {p} --device cuda:{gpu} "
-                    f"> {log} 2>&1"
-                )
-                proc = subprocess.Popen(cmd, shell=True)
-                active[gpu] = (key, proc)
-                state["launched"].append(key)
+        # ---------------- Stage 1: wait A1 SFT ----------------
+        if stage == "a1_sft":
+            logf = ROOT / "runs" / "train_a1_sft_ddp_lmhead.log"
+            if (not pgrep_running("train_sft.py --group a1")
+                    and logf.exists() and "SFT done" in logf.read_text()):
+                print("[orch] A1 SFT finished -> evaluate best (3-card shard)", flush=True)
+                procs = {}
+                for gpu in range(3):
+                    log = ROOT / "runs" / f"eval_A1_id_shard{gpu}.log"
+                    procs[f"A1_eval_shard{gpu}"] = launch(
+                        eval_cmd("a1", f"{ROOT}/runs/A1/sft/best", gpu, gpu, 3), log)
+                state["procs"] = {k: None for k in procs}
+                # keep Popen handles in-process only (not serializable)
+                state["stage"] = "a1_eval"
                 save_state(state)
-                print(f"[orch] launched {key} on cuda:{gpu}", flush=True)
+                # stash procs in a module-level holder for subsequent polls
+                main.procs = procs
+                continue
+            time.sleep(30)
+            continue
+
+        # ---------------- Stage 2: A1 eval -> merge -> B2 SFT ----------------
+        if stage == "a1_eval":
+            procs = getattr(main, "procs", {})
+            alive = [t for t, p in procs.items() if p.poll() is None]
+            if alive:
+                time.sleep(30)
+                continue
+            merged = merge_shards(ROOT / "runs" / "A1")
+            if merged is None:
+                print("[orch] A1 shards missing; waiting", flush=True)
+                time.sleep(30)
+                continue
+            print(f"[orch] A1 best ID eval: {json.dumps(merged)}", flush=True)
+            print("[orch] -> launching B2 SFT (fresh, 3-card DDP, 4 epochs)", flush=True)
+            log = ROOT / "runs" / "train_b2_sft_ddp4.log"
+            main.b2_proc = launch(sft_cmd("b2", 4), log)
+            state["stage"] = "b2_sft"
+            save_state(state)
+            continue
+
+        # ---------------- Stage 3: wait B2 SFT ----------------
+        if stage == "b2_sft":
+            p = getattr(main, "b2_proc", None)
+            if p is not None and p.poll() is None:
+                time.sleep(30)
+                continue
+            logf = ROOT / "runs" / "train_b2_sft_ddp4.log"
+            if logf.exists() and "SFT done" in logf.read_text():
+                print("[orch] B2 SFT finished -> evaluate best (3-card shard)", flush=True)
+                procs = {}
+                for gpu in range(3):
+                    log = ROOT / "runs" / f"eval_B2_id_shard{gpu}.log"
+                    procs[f"B2_eval_shard{gpu}"] = launch(
+                        eval_cmd("b2", f"{ROOT}/runs/B2/sft/best", gpu, gpu, 3), log)
+                main.procs = procs
+                state["stage"] = "b2_eval"
+                save_state(state)
+                continue
+            time.sleep(30)
+            continue
+
+        # ---------------- Stage 4: B2 eval -> merge -> GRPO ----------------
+        if stage == "b2_eval":
+            procs = getattr(main, "procs", {})
+            alive = [t for t, p in procs.items() if p.poll() is None]
+            if alive:
+                time.sleep(30)
+                continue
+            merged = merge_shards(ROOT / "runs" / "B2")
+            if merged is None:
+                print("[orch] B2 shards missing; waiting", flush=True)
+                time.sleep(30)
+                continue
+            print(f"[orch] B2 best ID eval: {json.dumps(merged)}", flush=True)
+            print("[orch] -> launching B2 GRPO (3-card rollout-parallel)", flush=True)
+            log = ROOT / "runs" / "train_b2_grpo_dist.log"
+            main.b2_grpo_proc = launch(grpo_cmd("b2"), log)
+            state["stage"] = "b2_grpo"
+            save_state(state)
+            continue
+
+        # ---------------- Stage 5: wait B2 GRPO ----------------
+        if stage == "b2_grpo":
+            p = getattr(main, "b2_grpo_proc", None)
+            if p is not None and p.poll() is None:
+                time.sleep(60)
+                continue
+            logf = ROOT / "runs" / "train_b2_grpo_dist.log"
+            if logf.exists() and "GRPO done" in logf.read_text():
+                print("[orch] B2 GRPO finished.", flush=True)
+                state["stage"] = "done"
+                save_state(state)
+                continue
+            time.sleep(60)
+            continue
+
+        if stage == "done":
+            print("[orch] pipeline complete.", flush=True)
+            time.sleep(3600)
 
         time.sleep(30)
 
+
+main.procs = {}
+main.b2_proc = None
+main.b2_grpo_proc = None
 
 if __name__ == "__main__":
     main()
