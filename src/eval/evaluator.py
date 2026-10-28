@@ -145,6 +145,8 @@ class Evaluator:
                     aggr[k].append(v)
             if return_per_instruction:
                 per_instr.append({"instruction": instr, "task": task, "metrics": m})
+                print(f"  [eval {i + 1}/{len(instructions)}] sr={m['success_rate']:.2f} "
+                      f"task={task or '(none)'} | {instr[:70]}", flush=True)
         agg = {k: float(np.mean(v)) for k, v in aggr.items() if v}
         return (agg, per_instr) if return_per_instruction else agg
 
