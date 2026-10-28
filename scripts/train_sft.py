@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
 import sys
 from pathlib import Path
@@ -30,6 +31,18 @@ from src.models.factory import build_model  # noqa: E402
 from src.training.sft import SFTTrainer  # noqa: E402
 from src.utils.ckpt import resolve_resume  # noqa: E402
 from src.utils.logger import Logger  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+
+
+def _ddp_setup():
+    """torchrun DDP init; returns (rank, world) or (None, 1) for single-GPU."""
+    if "LOCAL_RANK" not in os.environ:
+        return None, 1
+    rank = int(os.environ["LOCAL_RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.distributed.init_process_group(backend="nccl")
+    torch.cuda.set_device(rank)
+    return rank, world
 
 
 def main():
@@ -63,7 +76,6 @@ def main():
                               "sft_train")
         val_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
                             "sft_val")
-        from torch.utils.data import DataLoader
 
         def csi_collate(batch):
             # drop samples whose TTS wav is missing (graceful degradation)
@@ -93,14 +105,31 @@ def main():
                                        args.num_workers)
 
     model = build_model(cfg, stage="sft")
-    trainer = SFTTrainer(model, cfg, device=args.device)
+    rank, world = _ddp_setup()
+    if rank is not None:
+        device = f"cuda:{rank}"
+        model.to(device)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[rank], find_unused_parameters=True)
+        from torch.utils.data import DistributedSampler
+        train_loader = DataLoader(
+            train_loader.dataset, batch_size=train_loader.batch_size,
+            sampler=DistributedSampler(train_loader.dataset, num_replicas=world,
+                                       rank=rank, shuffle=True),
+            collate_fn=train_loader.collate_fn, num_workers=args.num_workers)
+    else:
+        device = args.device
+    trainer = SFTTrainer(model, cfg, device=device, is_main=(rank in (None, 0)))
 
     resume = resolve_resume(args.resume, cfg.sft_ckpt_dir, "sft")
     best_ckpt = trainer.train(train_loader, val_loader, logger, resume_from=resume,
                               smoke_steps=args.smoke)
-    logger.log({"sft/best_ckpt": str(best_ckpt)})
-    logger.finish()
-    print(f"SFT done. GRPO starting checkpoint: {best_ckpt}")
+    if rank in (None, 0):
+        logger.log({"sft/best_ckpt": str(best_ckpt)})
+        logger.finish()
+        print(f"SFT done. GRPO starting checkpoint: {best_ckpt}")
+    if rank is not None:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

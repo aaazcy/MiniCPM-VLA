@@ -227,6 +227,12 @@ class MiniCPMoWrapper(nn.Module):
         seq_lens = inputs["attention_mask"].sum(dim=1) - 1
         return hs[torch.arange(len(seq_lens)), seq_lens]
 
+    def forward(self, images: torch.Tensor, lang_texts: List[str],
+                audio_wavs: Optional[List] = None,
+                actions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # alias so DDP hooks apply: DDP intercepts .forward(), NOT .forward_sft
+        return self.forward_sft(images, lang_texts, audio_wavs, actions)
+
     def forward_sft(self, images: torch.Tensor, lang_texts: List[str],
                     audio_wavs: Optional[List] = None,
                     actions: Optional[torch.Tensor] = None) -> torch.Tensor:

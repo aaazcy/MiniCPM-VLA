@@ -117,6 +117,12 @@ class OpenVLAWrapper(nn.Module):
         logits_full = lm_head(hs)                               # (B, n_pos, V)
         return logits_full[:, :, -self.num_bins:]               # (B, n_pos, 256)
 
+    def forward(self, images: torch.Tensor, lang_texts: List[str],
+                audio_wavs: Optional[List] = None,
+                actions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # alias so DDP hooks apply: DDP intercepts .forward(), NOT .forward_sft
+        return self.forward_sft(images, lang_texts, audio_wavs, actions)
+
     def forward_sft(self, images: torch.Tensor, lang_texts: List[str],
                     audio_wavs: Optional[List] = None,
                     actions: Optional[torch.Tensor] = None) -> torch.Tensor:

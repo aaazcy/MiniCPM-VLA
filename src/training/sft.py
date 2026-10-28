@@ -41,10 +41,15 @@ def make_optimizer(model: nn.Module, lr_head: float, lr_lora: float,
 
 
 class SFTTrainer:
-    def __init__(self, model, cfg, device="cuda"):
+    def __init__(self, model, cfg, device="cuda", is_main: bool = True):
         self.model = model
         self.cfg = cfg
         self.device = device
+        self.is_main = is_main
+        # modern DDP does NOT forward arbitrary attrs (dtype, custom methods):
+        # keep a handle on the raw module for those
+        self.raw = model.module if hasattr(model, "module") else model
+        self.model_dtype = getattr(self.raw, "dtype", torch.bfloat16)
         self.model.to(device)
         self.opt = make_optimizer(model, cfg.sft.lr_action_head, cfg.sft.lr_lora,
                                   cfg.sft.weight_decay)
@@ -54,8 +59,8 @@ class SFTTrainer:
         self.epoch = 0
         self.global_step = 0
         if cfg.sft.gradient_checkpointing:
-            for target in (model, getattr(model, "llm", None),
-                           getattr(getattr(model, "llm", None), "base_model", None)):
+            for target in (self.raw, getattr(self.raw, "llm", None),
+                           getattr(getattr(self.raw, "llm", None), "base_model", None)):
                 if target is not None and hasattr(target, "gradient_checkpointing_enable"):
                     try:
                         target.gradient_checkpointing_enable()
@@ -75,20 +80,21 @@ class SFTTrainer:
             if max_batches is not None and bi >= max_batches:
                 break
             px = batch["pixel_values"].to(self.device, torch.float32)
-            act = batch["actions"].to(self.device, self.model.dtype)
+            act = batch["actions"].to(self.device, self.model_dtype)
 
             with torch.autocast(device_type="cuda" if self.device.startswith("cuda") else "cpu",
                                 dtype=torch.bfloat16, enabled=self.cfg.sft.bf16):
                 audio = batch.get("audio_wavs")
-                pred = self.model.forward_sft(px, batch["langs"], audio, act)
+                # call the module itself (not .forward_sft) so DDP's sync hooks run
+                pred = self.model(px, batch["langs"], audio, act)
                 loss = self.loss_fn(pred, act)
 
             if train:
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.trainable_parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.raw.trainable_parameters(), 1.0)
                 self.opt.step()
-                if self.global_step % self.cfg.wandb.log_every_steps == 0:
+                if self.is_main and self.global_step % self.cfg.wandb.log_every_steps == 0:
                     logger.log({"sft/train_mse": loss.item(), "sft/step": self.global_step},
                                step=self.global_step)
             total_mse += loss.item() * len(act)
@@ -114,43 +120,52 @@ class SFTTrainer:
             train_mse = self.run_epoch(train_loader, logger, train=True,
                                        max_batches=smoke_steps)
             val_mse = self.run_epoch(val_loader, logger, train=False,
-                                     max_batches=smoke_steps)
-            logger.log({"sft/smoke_train_mse": train_mse,
-                        "sft/smoke_val_mse": val_mse})
-            log.info("[SFT smoke] train mse %.6f | val mse %.6f", train_mse, val_mse)
-            self.save(ckpt_dir / "smoke")
+                                     max_batches=smoke_steps) if self.is_main \
+                else float("nan")
+            if self.is_main:
+                logger.log({"sft/smoke_train_mse": train_mse,
+                            "sft/smoke_val_mse": val_mse})
+                log.info("[SFT smoke] train mse %.6f | val mse %.6f", train_mse, val_mse)
+                self.save(ckpt_dir / "smoke")
             return ckpt_dir / "smoke"
         history: Dict[str, list] = {"train_mse": [], "val_mse": []}
 
         for epoch in range(self.epoch, self.cfg.sft.max_epochs):
             self.epoch = epoch
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
             train_mse = self.run_epoch(train_loader, logger, train=True)
-            val_mse = self.run_epoch(val_loader, logger, train=False)
-            history["train_mse"].append(train_mse)
-            history["val_mse"].append(val_mse)
-            logger.log({"sft/epoch": epoch, "sft/train_mse_epoch": train_mse,
-                        "sft/val_mse": val_mse}, step=epoch)
-            log.info("[SFT] epoch %d | train mse %.6f | val mse %.6f", epoch, train_mse, val_mse)
+            val_mse = self.run_epoch(val_loader, logger, train=False) if self.is_main \
+                else float("inf")
+            if self.is_main:
+                history["train_mse"].append(train_mse)
+                history["val_mse"].append(val_mse)
+                logger.log({"sft/epoch": epoch, "sft/train_mse_epoch": train_mse,
+                            "sft/val_mse": val_mse}, step=epoch)
+                log.info("[SFT] epoch %d | train mse %.6f | val mse %.6f", epoch, train_mse, val_mse)
 
             if val_mse < self.best_val_mse - 1e-7:
                 self.best_val_mse = val_mse
                 self.patience_left = self.cfg.sft.early_stop_patience
-                self.save(ckpt_dir / "best")
+                if self.is_main:
+                    self.save(ckpt_dir / "best")
             else:
                 self.patience_left -= 1
                 if self.patience_left <= 0:
                     log.info("[SFT] early stop at epoch %d (val mse plateau)", epoch)
                     break
-            self.save(ckpt_dir / "last")
+            if self.is_main:
+                self.save(ckpt_dir / "last")
 
-        with open(ckpt_dir / "history.json", "w") as f:
-            json.dump(history, f, indent=2)
+        if self.is_main:
+            with open(ckpt_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
         return ckpt_dir / "best"
 
     # ------------------------------------------------------------------ #
     def save(self, path: Path):
         path.mkdir(parents=True, exist_ok=True)
-        self.model.save_adapter(str(path))
+        self.raw.save_adapter(str(path))
         torch.save({"opt": self.opt.state_dict(), "epoch": self.epoch,
                     "best_val_mse": self.best_val_mse, "cfg": self.cfg.to_dict()},
                    path / "trainer_state.pt")
