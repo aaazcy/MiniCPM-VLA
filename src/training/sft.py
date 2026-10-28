@@ -30,7 +30,7 @@ def make_optimizer(model: nn.Module, lr_head: float, lr_lora: float,
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "action_head" in name or "native" in name:
+        if "action_head" in name or "native" in name or "lm_head" in name:
             head_params.append(p)
         else:
             lora_params.append(p)

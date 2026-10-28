@@ -72,6 +72,15 @@ class OpenVLAWrapper(nn.Module):
             self.base.language_model = self.llm
             log.info("OpenVLA: LoRA on LLM (r=%d, alpha=%d)", lora_r, lora_alpha)
 
+        # Full fine-tune the native action head (lm_head) so it can adapt to CALVIN.
+        # LoRA only adapts the LLM representation; a frozen pre-trained head collapses
+        # to a constant action (smoothness 0) on out-of-domain data. Only the last
+        # num_bins columns receive gradients (the CE loss uses just those), so the
+        # pre-trained text-vocab columns are effectively untouched.
+        self.lm_head = getattr(self.llm, "lm_head", None) or self.llm.base_model.model.lm_head
+        for p in self.lm_head.parameters():
+            p.requires_grad = True
+
     # ------------------------------------------------------------------ #
     def prepare_for_sft(self) -> None:
         # LoRA params are already requires_grad=True from get_peft_model;
@@ -263,8 +272,14 @@ class OpenVLAWrapper(nn.Module):
         os.makedirs(path, exist_ok=True)
         if isinstance(self.llm, PeftModel):
             self.llm.save_pretrained(path)
+        # the full-fine-tuned action head is not part of the LoRA adapter -> save it
+        torch.save(self.lm_head.state_dict(), f"{path}/lm_head.pt")
 
     def load_adapter(self, path: str) -> None:
+        import os
         from peft import PeftModel
         if isinstance(self.llm, PeftModel):
             self.llm.load_adapter(path, adapter_name="default")
+        head_path = f"{path}/lm_head.pt"
+        if os.path.exists(head_path):
+            self.lm_head.load_state_dict(torch.load(head_path, map_location="cpu"))
