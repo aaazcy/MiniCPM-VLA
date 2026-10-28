@@ -38,11 +38,18 @@ def main():
     ap.add_argument("--resume", default=None, help="checkpoint dir | 'latest'")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=None, help="override sft.max_epochs")
+    ap.add_argument("--batch-size", type=int, default=None, help="override sft.batch_size")
     ap.add_argument("--smoke", type=int, default=0,
                     help="run only N training batches (pipeline validation)")
     args = ap.parse_args()
 
     cfg = load_config(args.group)
+    # quick overrides for cold-start probes / hyperparameter sweeps
+    if args.epochs is not None:
+        cfg.sft.max_epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.sft.batch_size = args.batch_size
     torch.manual_seed(cfg.experiment.seed)
     np.random.seed(cfg.experiment.seed)
     random.seed(cfg.experiment.seed)

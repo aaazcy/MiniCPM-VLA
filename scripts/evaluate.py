@@ -67,9 +67,14 @@ def main():
                     help="collect 50 failed trajectories for failure labeling")
     ap.add_argument("--ckpt", default="auto", help="checkpoint dir | 'auto'")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--quick", action="store_true",
+                    help="cold-start probe: 5 instructions x 3 seeds (~15 min)")
     args = ap.parse_args()
 
     cfg = load_config(args.group)
+    if args.quick:
+        cfg.eval.max_episodes = 5
+        cfg.eval.seeds = 3
     # Cross-modal override: rebuild the SAME model with the other input channel.
     # Base weights are identical across B groups, so B2-ckpt-on-audio and
     # B3-ckpt-on-text are valid zero-shot transfer tests.
