@@ -69,33 +69,47 @@ def main():
 
     logger = Logger(cfg, cfg.group.id, tags=["sft", cfg.group.family])
 
-    # B3 uses the CSI speech dataset; the other groups use CALVIN + Bridge
+    # B3 uses the CSI speech dataset; the other groups use CALVIN (+Bridge if requested)
     if cfg.group.audio:
         from src.data.csi import CSIDataset
-        train_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
-                              "sft_train")
-        val_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
-                            "sft_val")
+        steps_per_traj = cfg.sft.steps_per_traj
+        val_chunk_size = getattr(cfg.sft, "val_chunk_size", 8)
 
-        def csi_collate(batch):
-            # drop samples whose TTS wav is missing (graceful degradation)
-            batch = [b for b in batch if b["audio_wav"] is not None]
-            if not batch:
-                return None
-            px, acts, langs, auds = [], [], [], []
-            for b in batch:
-                T = b["pixel_values"].shape[0]
-                px.append(b["pixel_values"])
-                acts.append(b["actions"])
-                langs.extend([b["lang"]] * T)
-                auds.extend([b["audio_wav"]] * T)
-            return {"pixel_values": torch.cat(px), "actions": torch.cat(acts),
-                    "lang_tokens": None, "attention_mask": None, "langs": langs,
-                    "audio_wavs": auds}
+        def make_csi_collate(cap: int, train: bool):
+            def csi_collate(batch):
+                # drop samples whose TTS wav is missing (graceful degradation)
+                batch = [b for b in batch if b["audio_wav"] is not None]
+                if not batch:
+                    return None
+                import random as _r
+                px, acts, langs, auds = [], [], [], []
+                for b in batch:
+                    T = b["pixel_values"].shape[0]
+                    if T > cap:
+                        start = _r.randint(0, T - cap) if train else 0
+                        sl = slice(start, start + cap)
+                    else:
+                        sl = slice(0, T)
+                    n = sl.stop - sl.start
+                    px.append(b["pixel_values"][sl])
+                    acts.append(b["actions"][sl])
+                    langs.extend([b["lang"]] * n)
+                    auds.extend([b["audio_wav"]] * n)
+                return {"pixel_values": torch.cat(px), "actions": torch.cat(acts),
+                        "lang_tokens": None, "attention_mask": None, "langs": langs,
+                        "audio_wavs": auds}
+            return csi_collate
+
+        train_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
+                              "sft_train", chunk_size=None)
+        val_ds = CSIDataset(Path(cfg.dataset.csi_root), Path(cfg.dataset.calvin_root),
+                            "sft_val", chunk_size=val_chunk_size)
         train_loader = DataLoader(train_ds, batch_size=cfg.sft.batch_size, shuffle=True,
-                                  collate_fn=csi_collate, num_workers=args.num_workers)
+                                  collate_fn=make_csi_collate(steps_per_traj, True),
+                                  num_workers=args.num_workers)
         val_loader = DataLoader(val_ds, batch_size=cfg.sft.batch_size, shuffle=False,
-                                collate_fn=csi_collate, num_workers=args.num_workers)
+                                collate_fn=make_csi_collate(val_chunk_size, False),
+                                num_workers=args.num_workers)
     else:
         from src.models.factory import build_processor
         processor = build_processor(cfg)

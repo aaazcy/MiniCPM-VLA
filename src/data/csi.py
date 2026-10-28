@@ -88,7 +88,8 @@ class CSIDataset(Dataset):
     synthesized wavs live in csi_root/wav/<sha256(lang)>.wav (same keying as rollout).
     """
 
-    def __init__(self, csi_root: Path, calvin_root: Path, split: str = "sft_train"):
+    def __init__(self, csi_root: Path, calvin_root: Path, split: str = "sft_train",
+                 chunk_size: int = None):
         self.csi_root = Path(csi_root)
         self.calvin_root = Path(calvin_root)
         self.split = split
@@ -96,24 +97,41 @@ class CSIDataset(Dataset):
         from .splits import load_manifest
         manifest = load_manifest(self.calvin_root / "splits" / f"calvin_{split}.json")
         self.ids: List[str] = sorted(manifest["ids"])
+        self.chunk_size = chunk_size
+        self._index = None
+        if chunk_size and chunk_size > 0:
+            self._index = []
+            for i in range(len(self.ids)):
+                with np.load(self._npz_path(i)) as f:
+                    t = int(f["actions"].shape[0])
+                for s in range(0, t, chunk_size):
+                    self._index.append((i, s, min(s + chunk_size, t)))
+
+    def _npz_path(self, i: int) -> Path:
+        traj_id = self.ids[i]
+        p = self.calvin_root / self.split / f"{traj_id}.npz"
+        if not p.exists() and self.split == "sft_val":
+            p = self.calvin_root / "sft_train" / f"{traj_id}.npz"
+        return p
 
     def __len__(self):
-        return len(self.ids)
+        return len(self._index) if self._index is not None else len(self.ids)
 
     def __getitem__(self, idx: int):
-        traj_id = self.ids[idx]
-        npz_path = self.calvin_root / self.split / f"{traj_id}.npz"
-        if not npz_path.exists() and self.split == "sft_val":
-            npz_path = self.calvin_root / "sft_train" / f"{traj_id}.npz"
-        with np.load(npz_path) as f:
-            rgb = torch.from_numpy(f["rgb"]).float() / 255.0   # (T,3,224,224)
-            actions = torch.from_numpy(f["actions"])            # (T,7)
+        if self._index is not None:
+            i, s, e = self._index[idx]
+            sl = slice(s, e)
+        else:
+            i, sl = idx, slice(0, None)
+        with np.load(self._npz_path(i)) as f:
+            rgb = torch.from_numpy(f["rgb"][sl]).float() / 255.0   # (K,3,224,224)
+            actions = torch.from_numpy(f["actions"][sl])            # (K,7)
             lang = str(f["lang"])
-            proprio = f["proprio"] if "proprio" in f else np.zeros((len(actions), 8),
-                                                                   dtype=np.float32)
+            proprio = f["proprio"][sl] if "proprio" in f else np.zeros(
+                (actions.shape[0], 8), dtype=np.float32)
         wav = self._load_wav(lang)
         return {"pixel_values": rgb, "actions": actions, "lang": lang, "audio_wav": wav,
-                "id": traj_id, "proprio": torch.from_numpy(proprio)}
+                "id": self.ids[i], "proprio": torch.from_numpy(proprio)}
 
     def _load_wav(self, lang: str) -> Optional[torch.Tensor]:
         import hashlib

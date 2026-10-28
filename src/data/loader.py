@@ -30,9 +30,13 @@ def _load_manifest_set(root: Path, name: str) -> set:
 
 
 def _resolve_split_ids(root: Path, split: str) -> List[str]:
-    """Map logical split name -> trajectory id list with leak assertions."""
+    """Map logical split name -> CALVIN trajectory id list with leak assertions.
+
+    NOTE: CALVIN-only by default. Bridge (if requested) is added separately by
+    build_sft_loaders, never unioned into the CALVIN split manifests.
+    """
     if split in ("sft_train", "sft_val"):
-        ids = _load_manifest_set(root, f"calvin_{split}") | _load_manifest_set(root, "bridge_train")
+        ids = _load_manifest_set(root, f"calvin_{split}")
     elif split == "calvin_train":
         ids = _load_manifest_set(root, "calvin_sft_train")
     elif split == "calvin_sft_val":
@@ -44,13 +48,27 @@ def _resolve_split_ids(root: Path, split: str) -> List[str]:
 
 
 class CalvinDataset(Dataset):
-    """Single trajectory per item: images (T,3,224,224), actions (T,7), lang string."""
+    """Single trajectory per item: images (T,3,224,224), actions (T,7), lang string.
 
-    def __init__(self, root: Path, split: str, transform=None):
+    With `chunk_size` set, yields consecutive chunks of steps (used for full-coverage
+    validation); otherwise yields the whole trajectory and the collate samples a
+    random chunk per epoch (training).
+    """
+
+    def __init__(self, root: Path, split: str, transform=None, chunk_size: int = None):
         self.root = Path(root)
         self.split = split
         self.ids = _resolve_split_ids(self.root, split)
         self.transform = transform
+        self.chunk_size = chunk_size
+        self._index = None
+        if chunk_size and chunk_size > 0:
+            self._index = []
+            for i in range(len(self.ids)):
+                with np.load(self._npz_path(i)) as f:
+                    t = int(f["actions"].shape[0])
+                for s in range(0, t, chunk_size):
+                    self._index.append((i, s, min(s + chunk_size, t)))
 
         # Leakage guard on every load
         train = _load_manifest_set(self.root, "calvin_sft_train")
@@ -61,7 +79,7 @@ class CalvinDataset(Dataset):
                         "id_test": id_test, "ood_test": ood_test})
 
     def __len__(self):
-        return len(self.ids)
+        return len(self._index) if self._index is not None else len(self.ids)
 
     def _npz_path(self, idx: int) -> Path:
         p = self.root / self.split / f"{self.ids[idx]}.npz"
@@ -71,18 +89,23 @@ class CalvinDataset(Dataset):
         return p
 
     def __getitem__(self, idx: int):
-        with np.load(self._npz_path(idx)) as f:
-            rgb = f["rgb"]            # (T,3,224,224) uint8
-            actions = f["actions"]    # (T,7) float32
+        if self._index is not None:
+            i, s, e = self._index[idx]
+            sl = slice(s, e)
+        else:
+            i, sl = idx, slice(0, None)
+        with np.load(self._npz_path(i)) as f:
+            rgb = f["rgb"][sl]            # (K,3,224,224) uint8
+            actions = f["actions"][sl]    # (K,7) float32
             lang = str(f["lang"])
-            proprio = f["proprio"] if "proprio" in f else np.zeros((len(actions), 8),
-                                                                   dtype=np.float32)
+            proprio = f["proprio"][sl] if "proprio" in f else np.zeros(
+                (actions.shape[0], 8), dtype=np.float32)
         if self.transform is not None:
             rgb = self.transform(rgb)
         else:
             rgb = torch.from_numpy(rgb).float() / 255.0
         return {"pixel_values": rgb, "actions": torch.from_numpy(actions), "lang": lang,
-                "id": self.ids[idx], "proprio": torch.from_numpy(proprio)}
+                "id": self.ids[i], "proprio": torch.from_numpy(proprio)}
 
 
 class BridgeDataset(Dataset):
@@ -120,27 +143,34 @@ class BridgeDataset(Dataset):
 def build_sft_loaders(cfg, processor, split: str, batch_size: int, num_workers: int = 8):
     """Build train/val DataLoaders for SFT. split in {"sft_train","sft_val"}.
 
-    Items are re-windowed into single steps (image, action, lang) by the collate fn,    because SFT supervises step-level MSE. Language is passed as raw text; each model
-    wrapper runs its own processor internally.
+    Training: one whole CALVIN trajectory per item; the collate samples a random
+    `steps_per_traj`-long chunk per epoch (bounded memory, multiple epochs cover
+    the trajectory). Bridge is added only if "bridge" is in cfg.group.dataset.
+
+    Validation: CALVIN trajectories are pre-chunked (val_chunk_size) so early
+    stopping sees every frame, not just the first few.
     """
     from torch.utils.data import DataLoader
 
     steps_per_traj = cfg.sft.steps_per_traj
+    val_chunk_size = getattr(cfg.sft, "val_chunk_size", 8)
+
+    # training caps each item to a random chunk of `cap` steps; val items are already
+    # chunks and are passed through untouched.
+    cap = val_chunk_size if split == "sft_val" else steps_per_traj
 
     def step_collate(batch):
-        # flatten (T, ...) trajectory items into individual steps; cap the number of
-        # steps per trajectory so the effective step-batch stays memory-bounded
-        # (batch_size counts TRAJECTORIES, not steps).
+        # flatten (T, ...) trajectory/chunk items into individual steps
         import random as _r
         pixels, acts, langs, proprios = [], [], [], []
         for b in batch:
             T = b["pixel_values"].shape[0]
-            if T > steps_per_traj:
+            if T > cap:
                 if split == "sft_train":
-                    start = _r.randint(0, T - steps_per_traj)  # random window
+                    start = _r.randint(0, T - cap)  # random window
                 else:
                     start = 0
-                sl = slice(start, start + steps_per_traj)
+                sl = slice(start, start + cap)
             else:
                 sl = slice(0, T)
             pixels.append(b["pixel_values"][sl])
@@ -153,10 +183,14 @@ def build_sft_loaders(cfg, processor, split: str, batch_size: int, num_workers: 
         return {"pixel_values": pixel_batch, "actions": act_batch,
                 "langs": langs, "proprio": proprio_batch}
 
-    # combined loader: CALVIN (+ Bridge for training only; SFT-val is CALVIN-only)
-    ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split)]
-    if split == "sft_train":
-        ds_list.append(BridgeDataset(Path(cfg.dataset.bridge_root), split))
+    # combined loader: CALVIN (+ Bridge for training only if requested)
+    if split == "sft_val":
+        ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split,
+                                 chunk_size=val_chunk_size)]
+    else:
+        ds_list = [CalvinDataset(Path(cfg.dataset.calvin_root), split)]
+        if "bridge" in cfg.group.dataset:
+            ds_list.append(BridgeDataset(Path(cfg.dataset.bridge_root), split))
     ds = torch.utils.data.ConcatDataset(ds_list)
     return DataLoader(ds, batch_size=batch_size, shuffle=(split == "sft_train"),
                       collate_fn=step_collate, num_workers=num_workers, pin_memory=True)
