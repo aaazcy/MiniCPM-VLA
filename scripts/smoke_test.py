@@ -34,7 +34,7 @@ def test_configs():
         check(f"cfg {g}", cfg.group.id == g.upper())
     cfg = load_config("b2")
     check("grpo hyperparams locked", (cfg.grpo.group_size, cfg.grpo.rollout_per_group,
-                                       cfg.grpo.clip_eps, cfg.grpo.beta_kl) == (4, 4, 0.2, 0.05))
+                                       cfg.grpo.clip_eps, cfg.grpo.beta_kl) == (8, 2, 0.2, 0.05))
     check("lr split", (cfg.sft.lr_action_head, cfg.sft.lr_lora) == (1e-4, 2e-5))
     check("reward lambdas", (cfg.reward.lambda_dist,
                              cfg.reward.lambda_action) == (0.5, 0.1))

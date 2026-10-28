@@ -53,9 +53,10 @@ RL), and what does synchronized synthesized speech (B3) add?
 - **SFT**: discrete-head CE (MiniCPM-o) / native-bin CE (OpenVLA); AdamW; lr head=1e-4,
   LoRA=2e-5; batch 1 chunk × 4 steps (full-coverage chunked sampling); wd 1e-4; grad ckpt;
   early stop on SFT-val loss (val never used in RL)
-- **GRPO**: group_size=4, rollout_per_group=4, clip_eps=0.2, beta_kl=0.05; lr head=1e-4,
-  LoRA=2e-5; max_grad_norm=1.0; group-relative advantage (no critic); KL vs frozen SFT
-  reference; deterministic eval (temp=0) every 2000 episodes + checkpoint
+- **GRPO**: group_size=8, rollout_per_group=2, clip_eps=0.2, beta_kl=0.05; lr head=1e-4,
+  LoRA=2e-5; max_grad_norm=1.0; group-relative advantage (no critic), one instruction per
+  group (G=8 rollouts of the same task); KL vs frozen SFT reference; deterministic eval
+  (temp=0) every 2000 episodes + checkpoint
 - **Reward**: R = R_success + 0.5·R_dist + 0.1·R_action
   (success +10; dist −L2 ee→target with progress proxy; action jitter penalty)
 - **Splits guard**: 85/15 train/SFT-val; ID test = env-A validation (held-out); OOD = env-D;

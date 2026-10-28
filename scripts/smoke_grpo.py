@@ -115,8 +115,9 @@ def main():
     print(f"[obs] image shape={traj.obs[0]['pixel_values'].shape} "
           f"action shape={traj.actions[0].shape}")
 
-    # 2. one GRPO update (single group of 4 trajectories)
-    groups = [[trainer.rollout_one(instr, temperature=1.0) for _ in range(4)]]
+    # 2. one GRPO update (single group of `group_size` trajectories)
+    groups = [[trainer.rollout_one(instr, temperature=1.0)
+               for _ in range(cfg.grpo.group_size)]]
     stats = trainer.update(groups, LoggerStub())
     print(f"[update] {stats}")
 

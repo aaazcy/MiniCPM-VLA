@@ -4,8 +4,9 @@
     torchrun --nproc_per_node=3 scripts/train_grpo_dist.py --group b2
 
 Pattern (actor-learner, minimal synchronous form):
+  * rank 0 samples ONE instruction per group (G=8 rollouts of the same task)
   * ALL ranks hold a policy replica and sample rollouts in parallel (~6 each)
-  * trajectories gathered to rank 0
+  * trajectories gathered to rank 0 (in slot order -> regrouped)
   * rank 0 computes group-relative advantages + the clipped-ratio update
     (LoRA + action head only) and broadcasts the TRAINABLE weights back
   * repeat until total_env_steps
@@ -105,10 +106,24 @@ def main():
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     while True:
-        # ---- rollout phase: every rank samples its share in parallel ----
+        # ---- rollout phase: rank 0 samples ONE instruction per group, broadcast ----
+        # Textbook GRPO: a group = group_size rollouts of the SAME instruction, so
+        # the group-relative baseline compares responses to one task. Slots
+        # [0, n_total) map to group `slot // group_size`; each rank rolls out its
+        # share and trajectories come back in slot order.
+        if rank == 0:
+            group_instrs = [sampler.sample() for _ in range(g.rollout_per_group)]
+        else:
+            group_instrs = [None] * g.rollout_per_group
+        if world > 1:
+            dist.broadcast_object_list(group_instrs, src=0)
+
         local = []
-        for _ in range(per_rank):
-            instr, task = sampler.sample()
+        for j in range(per_rank):
+            slot = rank * per_rank + j
+            if slot >= n_total:
+                break
+            instr, task = group_instrs[slot // g.group_size]
             traj = trainer.rollout_one(instr, temperature=cfg.rollout.temperature,
                                        task=task)
             local.append(traj)

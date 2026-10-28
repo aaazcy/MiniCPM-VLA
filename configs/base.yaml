@@ -46,8 +46,8 @@ sft:
   bf16: true
 
 grpo:
-  group_size: 4
-  rollout_per_group: 4        # total trajectories per update = 4 * 4 = 16
+  group_size: 8               # textbook GRPO: one instruction, G=8 rollouts per group
+  rollout_per_group: 2        # total trajectories per update = 8 * 2 = 16
   clip_eps: 0.2
   beta_kl: 0.05
   lr_action_head: 1.0e-4      # LoRA+head, near-sparse reward, ~21 updates -> match SFT lr

@@ -61,7 +61,9 @@ Loss = **cross-entropy** on the quantized demonstration action (7×256 bins), id
 
 ```
 loop until total_env_steps:
-  1. rollout  rollout_per_group × group_size trajectories (16) in CALVIN
+  1. rollout  rollout_per_group × group_size trajectories (16) in CALVIN —
+              each group rolls out the SAME instruction group_size times
+              (textbook GRPO; the relative baseline compares responses to one task)
   2. reward   per-trajectory reward (see below)
   3. advantage  A = (R - mean(group)) / (std(group) + ε)   # no separate critic
   4. update   clipped policy loss + KL penalty vs frozen SFT reference
@@ -70,7 +72,7 @@ loop until total_env_steps:
 
 | Hyperparameter (locked across all groups) | Value |
 |---|---|
-| group_size / rollout_per_group | 4 / 4 (16 trajectories per update) |
+| group_size / rollout_per_group | 8 / 2 (16 trajectories per update; one instruction per group) |
 | clip ε / KL β | 0.2 / 0.05 |
 | lr action head / LoRA | 1e-4 / 2e-5 |
 | max grad norm | 1.0 |

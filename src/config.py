@@ -76,8 +76,8 @@ class SftCfg(BaseModel):
 
 
 class GrpoCfg(BaseModel):
-    group_size: int = 4
-    rollout_per_group: int = 4
+    group_size: int = 8
+    rollout_per_group: int = 2
     clip_eps: float = 0.2
     beta_kl: float = 0.05
     lr_action_head: float = 1.0e-4

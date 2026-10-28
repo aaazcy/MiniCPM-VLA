@@ -1,7 +1,7 @@
 """src/training/grpo.py — Stage 2: GRPO reinforcement-learning post-training.
 
 Fixed hyperparameters for ALL groups (locked in configs/base.yaml):
-    group_size=4, rollout_per_group=4, clip_eps=0.2, beta_kl=0.05
+    group_size=8, rollout_per_group=2, clip_eps=0.2, beta_kl=0.05
     lr_action_head=1e-4, lr_lora=2e-5, max_grad_norm=1.0, AdamW
 
 Loop (per spec):
@@ -245,12 +245,15 @@ class GRPOTrainer:
 
         while self.env_steps < g.total_env_steps:
             steps_before = self.env_steps
-            # step 1: rollout g.rollout_per_group groups x group_size trajectories
+            # step 1: rollout g.rollout_per_group groups x group_size trajectories.
+            # Textbook GRPO: each group rolls out the SAME instruction group_size
+            # times, so the group-relative baseline compares responses to one task
+            # (not mixed-difficulty instructions).
             groups = []
             for _ in range(g.rollout_per_group):
+                instr, task = self.instruction_sampler.sample()
                 group = []
                 for _ in range(g.group_size):
-                    instr, task = self.instruction_sampler.sample()
                     traj = self.rollout_one(instr, temperature=self.cfg.rollout.temperature,
                                             task=task)
                     group.append(traj)
