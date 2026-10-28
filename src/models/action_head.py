@@ -63,7 +63,7 @@ class DiscreteActionHead(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 4096, dims=(512, 256), action_dim: int = 7,
-                 num_bins: int = 256, init_std: float = 0.02):
+                 num_bins: int = 255, init_std: float = 0.02):
         super().__init__()
         d1, d2 = dims
         self.action_dim = action_dim
@@ -77,9 +77,12 @@ class DiscreteActionHead(nn.Module):
             nn.GELU(),
             nn.Linear(d2, action_dim * num_bins),
         )
-        # same uniform bins as OpenVLA's native head
-        self.register_buffer("bin_centers", torch.linspace(-1.0, 1.0, num_bins),
-                             persistent=False)
+        # OpenVLA-exact bins: `num_bins` CENTERS = midpoints of `num_bins + 1` edges.
+        # OpenVLA defines `bins = linspace(-1,1,256)` (edges) and
+        # `bin_centers = (bins[:-1]+bins[1:])/2` (255 midpoints), so A and B now share
+        # the identical 255-center grid (centers range ~[-0.996, 0.996], never ±1).
+        bins = torch.linspace(-1.0, 1.0, num_bins + 1)
+        self.register_buffer("bin_centers", (bins[:-1] + bins[1:]) / 2.0, persistent=False)
         self.reset_parameters(init_std)
 
     def reset_parameters(self, std: float = 0.02) -> None:

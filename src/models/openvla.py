@@ -2,13 +2,13 @@
 
 Backbone: fused DINOv2+SigLIP vision + Llama2-7B LLM + native discretized action head
 (verified against the real modeling code):
-  * the "native action head" = the LAST 256 lm_head logits (uniform bins in [-1,1],
-    `self.bin_centers`); one action dimension = one generated token per step;
+  * the "native action head" = the LAST 255 lm_head logits (255 bin centers = midpoints
+    of 256 edges in [-1,1], `self.bin_centers`); one action dimension = one token/step;
   * `predict_action()` decodes via `discretized = vocab_size - token_ids`.
 
 Common interface (shared with MiniCPM-o wrapper):
     forward_sft(images, lang_texts, audio_wavs=None, actions=None) -> (B,7)
-        actions given (SFT): teacher-forced (B,7,256) logits -> E[action] = softmax @
+        actions given (SFT): teacher-forced (B,7,255) logits -> E[action] = softmax @
         bin_centers (differentiable, keeps the spec's MSE objective).
         actions None (rollout/eval): autoregressive generate + bin decode.
     logp_actions(images, lang_texts, actions, audio_wavs=None) -> (B,)
@@ -48,10 +48,10 @@ class OpenVLAWrapper(nn.Module):
         self.hidden_dim = 4096
         self.dtype = dtype
         self.vocab_size = self.base.vocab_size
-        self.bin_centers = self.base.bin_centers          # (256,) uniform in [-1,1]
+        self.bin_centers = self.base.bin_centers          # (255,) midpoints of 256 edges
         self.num_bins = len(self.bin_centers)
         self.action_dim = 7
-        self.action_head_type = "discrete"  # native 256-bin head (CE target)
+        self.action_head_type = "discrete"  # native 255-bin head (CE target)
         try:
             self.base.gradient_checkpointing_enable()
         except Exception as e:
@@ -238,7 +238,7 @@ class OpenVLAWrapper(nn.Module):
         inputs = self._prep_inputs(images, lang_texts)
         tok = self._token_ids(actions.to(images.device))
         ids, mask = self._teacher_force_ids(inputs, tok)
-        logits = self._head_logits(inputs, ids, mask, self.action_dim)  # (B,7,256)
+        logits = self._head_logits(inputs, ids, mask, self.action_dim)  # (B,7,255)
         logp = torch.log_softmax(logits, dim=-1)
         q = self._quantize(actions.to(images.device))
         return logp.gather(-1, q.unsqueeze(-1)).squeeze(-1).sum(-1)  # (B,)

@@ -39,7 +39,7 @@ def ckpt_action_head(ckpt_dir: Path) -> Optional[dict]:
 
     Checkpoints save the FULL resolved cfg (see SFTTrainer.save / GRPOTrainer.save);
     this lets us detect stale checkpoints from a previous architecture (e.g. the
-    continuous MLP head vs the current discretized 7x256-bin head) BEFORE loading
+    continuous MLP head vs the current discretized 7x255-bin head) BEFORE loading
     and failing with an opaque shape mismatch.
     """
     import torch

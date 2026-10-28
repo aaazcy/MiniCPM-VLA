@@ -40,7 +40,7 @@ class MiniCPMoWrapper(nn.Module):
                  lora_alpha: int = 16, lora_dropout: float = 0.0,
                  enable_audio: bool = False, audio_sample_rate: int = 16000,
                  audio_only: bool = False,
-                 action_head_type: str = "discrete", num_bins: int = 256,
+                 action_head_type: str = "discrete", num_bins: int = 255,
                  hf_cache_dir: Optional[str] = None,
                  dtype: torch.dtype = torch.bfloat16):
         super().__init__()

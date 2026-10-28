@@ -108,8 +108,10 @@ class VLLMEngine(RolloutEngine):
         # the adapter must be served from a shared directory vLLM can read.
         self.lora_path = lora_path
         self.sampling = SamplingParams(temperature=1.0, max_tokens=7, top_p=0.95)
-        # OpenVLA discretizes each action dim over 256 uniform bins in [-1, 1]
-        self.BIN_CENTERS = np.linspace(-1, 1, 256, dtype=np.float32)
+        # OpenVLA discretizes each action dim over 255 bin CENTERS (midpoints of 256
+        # edges in [-1, 1]), matching the model's `bin_centers` exactly.
+        bins = np.linspace(-1, 1, 256, dtype=np.float32)
+        self.BIN_CENTERS = ((bins[:-1] + bins[1:]) / 2.0).astype(np.float32)
 
     def act(self, obs, lang, audio_wav=None, temperature=1.0) -> np.ndarray:
         img = obs["pixel_values"]

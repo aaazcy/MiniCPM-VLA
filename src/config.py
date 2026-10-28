@@ -99,7 +99,7 @@ class RewardCfg(BaseModel):
 
 class ActionHeadCfg(BaseModel):
     type: Literal["discrete", "continuous"] = "discrete"
-    num_bins: int = 256
+    num_bins: int = 255
     hidden_dim: int = 4096
     dims: List[int] = [512, 256]
     action_dim: int = 7

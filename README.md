@@ -7,7 +7,7 @@ Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipul
 ## Highlights
 
 - **Omnimodal VLA**: image + text + speech (Whisper audio tower) inputs → 7-DoF action output (end-effector pose + gripper, [−1,1]).
-- **Discretized action head**: both families output a categorical distribution over 7×256 uniform bins in [−1,1], trained with **cross-entropy** (matching OpenVLA's native bin parameterization — avoids the mean-collapse of direct MSE regression).
+- **Discretized action head**: both families output a categorical distribution over 7×255 uniform bins in [−1,1] (255 bin centers = midpoints of 256 edges, matching OpenVLA's native parameterization exactly), trained with **cross-entropy** (avoids the mean-collapse of direct MSE regression).
 - **Two-stage post-training**: SFT (cross-entropy behavior cloning) → GRPO (group-relative policy optimization with KL constraint).
 - **Parameter-efficient**: LoRA adapters on the LLM + a **fully fine-tuned action head**. OpenVLA's native `lm_head` is unfrozen so it can adapt to CALVIN (a frozen pre-trained head collapses to a constant action on out-of-domain data).
 - **CALVIN success detection implemented**: the raw CALVIN env only reports `{robot_info, scene_info}`, so success was previously *always False*. We compute it via the official `Tasks` oracle and store the subtask name in the data.
@@ -35,18 +35,18 @@ Post-training the multimodal speech model **MiniCPM-o 4.5** into a robot-manipul
 
 ### Action head (shared by both families)
 
-- **Discrete, 256 bins** in [−1,1] per action dimension → 7×256-way categorical.
-- **A (OpenVLA)**: the native head = the **last 256 columns of the `lm_head`** logits (bin order reversed vs vocab → flipped in `_head_logits`). Fully fine-tuned; only those 256 columns receive gradients (the CE loss uses just them), so the pre-trained text-vocab columns are untouched.
-- **B (MiniCPM-o)**: a from-scratch `DiscreteActionHead` `Linear(4096→512)→LN→GELU→…→Linear(256→7×256)`.
+- **Discrete, 255 bins** in [−1,1] per action dimension → 7×255-way categorical (255 bin *centers* = midpoints of 256 edges, matching OpenVLA exactly).
+- **A (OpenVLA)**: the native head = the **last 255 columns of the `lm_head`** logits (bin order reversed vs vocab → flipped in `_head_logits`). Fully fine-tuned; only those 255 columns receive gradients (the CE loss uses just them), so the pre-trained text-vocab columns are untouched.
+- **B (MiniCPM-o)**: a from-scratch `DiscreteActionHead` `Linear(4096→512)→LN→GELU→…→Linear(256→7×255)`.
 - Rollout decodes `argmax` (eval, temp=0) or categorical sampling (training, temp=1.0); GRPO uses the categorical log-probability, matching OpenVLA.
 
 ### Stage 1: SFT (Supervised Fine-Tuning)
 
-Loss = **cross-entropy** on the quantized demonstration action (7×256 bins), identical for both families. (The `sft.loss: mse` config field is legacy — the trainer uses CE whenever the head is discrete, which is always the case here.)
+Loss = **cross-entropy** on the quantized demonstration action (7×255 bins), identical for both families. (The `sft.loss: mse` config field is legacy — the trainer uses CE whenever the head is discrete, which is always the case here.)
 
 | Component | Setting |
 |---|---|
-| Loss | cross-entropy on 7×256 bins (`expected_action` MSE logged as a diagnostic) |
+| Loss | cross-entropy on 7×255 bins (`expected_action` MSE logged as a diagnostic) |
 | Optimizer | AdamW, two param groups: **action head 1e-4**, **LoRA 2e-5**, weight decay 1e-4 |
 | Trainable | LoRA (A: q/k/v/o_proj; B: LLM LoRA) + **full action head** |
 | Chunking | full-coverage: each trajectory split into `steps_per_traj=4` chunks → every frame seen each epoch |

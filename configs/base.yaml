@@ -70,8 +70,8 @@ reward:                       # FIXED for all groups
 
 model:
   action_head:
-    type: discrete            # discrete (256 bins, matches OpenVLA) | continuous (legacy MLP)
-    num_bins: 256
+    type: discrete            # discrete (255 bin centers = midpoints of 256 edges, matches OpenVLA) | continuous (legacy MLP)
+    num_bins: 255
     hidden_dim: 4096          # last-token hidden size (Llama2-7B & Qwen3-8B both 4096)
     dims: [512, 256]
     action_dim: 7
