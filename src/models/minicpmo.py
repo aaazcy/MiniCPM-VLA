@@ -242,10 +242,13 @@ class MiniCPMoWrapper(nn.Module):
     def logp_actions(self, images: torch.Tensor, lang_texts: List[str],
                      actions: torch.Tensor,
                      audio_wavs: Optional[List] = None) -> torch.Tensor:
-        """Gaussian log-likelihood of the continuous actions under the action head
-        (unit variance). Used for GRPO importance ratios / KL."""
+        """Gaussian log-likelihood of the continuous actions under the action head.
+        sigma = 0.1 matches the rollout exploration noise (GRPO importance ratios)."""
         mu = self.forward_sft(images, lang_texts, audio_wavs)
-        return -0.5 * ((actions - mu) ** 2).sum(-1) - 0.5 * 7 * torch.log(torch.tensor(6.2832))
+        var = 0.1 ** 2
+        return -0.5 * ((actions - mu) ** 2).sum(-1) / var \
+            - 0.5 * 7 * torch.log(torch.tensor(6.2832 * var, device=mu.device,
+                                               dtype=mu.dtype))
 
     # ------------------------------------------------------------------ #
     def save_adapter(self, path: str) -> None:

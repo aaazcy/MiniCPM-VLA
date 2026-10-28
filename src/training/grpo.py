@@ -73,10 +73,11 @@ class GRPOTrainer:
             audio_wav = self._load_instruction_audio(instruction)
 
         for _ in range(self.cfg.grpo.max_traj_len):
-            action = self.engine.act(obs, instruction, audio_wav=audio_wav,
-                                     temperature=temperature)
+            action, logp_old = self.engine.act_logp(obs, instruction, audio_wav=audio_wav,
+                                                    temperature=temperature)
             traj.obs.append(obs)
             traj.actions.append(action)
+            traj.step_logps.append(logp_old)
             obs, _, done, info = env.step(action)
             traj.infos.append(info)
             if done:
@@ -166,6 +167,8 @@ class GRPOTrainer:
         pi_sum = 0.0
         n_steps = 0
         total_loss = 0.0
+        total_policy_loss = 0.0
+        total_kl = 0.0
         for i in range(0, len(steps), self.CHUNK):
             chunk = steps[i:i + self.CHUNK]
             imgs = torch.cat([s[0] for s in chunk], dim=0)
@@ -175,20 +178,26 @@ class GRPOTrainer:
             pi = self.policy.logp_actions(imgs, langs, acts, audio)   # (C,)
             a = a_flat[i:i + self.CHUNK]
             r = ref[i:i + self.CHUNK]
-            # single-pass approximation: importance ratio = 1 (logp_old = pi)
-            loss = -(a * pi).mean() + g.beta_kl * (r - pi).mean()
+            o = old[i:i + self.CHUNK]
+            # TRUE GRPO objective: clipped importance ratio exp(pi - logp_old)
+            ratio = torch.exp(pi - o)
+            clipped = torch.clamp(ratio, 1 - g.clip_eps, 1 + g.clip_eps)
+            policy_loss = -torch.min(ratio * a, clipped * a).mean()
+            kl = (r - pi).mean()
+            loss = policy_loss + g.beta_kl * kl
             loss.backward()          # graph freed immediately
             pi_sum += float(pi.detach().sum())
             total_loss += float(loss) * len(chunk)
+            total_policy_loss += float(policy_loss) * len(chunk)
+            total_kl += float(kl) * len(chunk)
             n_steps += len(chunk)
 
         torch.nn.utils.clip_grad_norm_(self.policy.trainable_parameters(), g.max_grad_norm)
         self.opt.step()
 
-        kl = float(ref.mean() - pi_sum / max(n_steps, 1))
         stats = {"grpo/loss": total_loss / max(n_steps, 1),
-                 "grpo/policy_loss": total_loss / max(n_steps, 1) - g.beta_kl * kl,
-                 "grpo/kl": kl,
+                 "grpo/policy_loss": total_policy_loss / max(n_steps, 1),
+                 "grpo/kl": total_kl / max(n_steps, 1),
                  "grpo/mean_reward": float(R.mean()),
                  "grpo/success_rate": float(np.mean([t.success for grp in groups for t in grp]))}
         logger.log({**stats, "grpo/update": self.update_count}, step=self.env_steps)

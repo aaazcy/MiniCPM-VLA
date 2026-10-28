@@ -48,6 +48,11 @@ class HFEngine(RolloutEngine):
 
     @torch.no_grad()
     def act(self, obs, lang, audio_wav=None, temperature=1.0) -> np.ndarray:
+        return self.act_logp(obs, lang, audio_wav, temperature)[0]
+
+    def act_logp(self, obs, lang, audio_wav=None, temperature=1.0):
+        """(action, logp_old) — the logp is under the SAMPLING distribution so the
+        GRPO importance ratio exp(logp_new - logp_old) is unbiased."""
         img = obs["pixel_values"]
         if img.max() > 1.5:  # uint8
             img = img.astype(np.float32) / 255.0
@@ -56,13 +61,21 @@ class HFEngine(RolloutEngine):
             img_t = img_t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
 
         audio_l = [torch.from_numpy(audio_wav).float()] if audio_wav is not None else None
+
+        if hasattr(self.policy, "sample_action"):  # OpenVLA / discrete B head: categorical
+            with torch.no_grad():
+                action, logp = self.policy.sample_action(img_t, [lang], temperature, audio_l)
+            return action[0].detach().cpu().numpy().astype(np.float32), float(logp)
+
+        # MiniCPM-o: deterministic MLP head + Gaussian exploration (sigma=0.1*temp)
         out = self.policy.forward_sft(img_t, [lang], audio_l)
-        action = out[0].detach().cpu().numpy().astype(np.float32)
+        mu = out[0].detach().cpu().numpy().astype(np.float32)
         if temperature > 0:
-            # stochastic rollout: add Gaussian noise (scaled by temperature)
-            action = action + self.rng.normal(0.0, 0.1 * temperature,
-                                              size=action.shape).astype(np.float32)
-        return np.clip(action, -1.0, 1.0).astype(np.float32)
+            noise = self.rng.normal(0.0, 0.1 * temperature, size=mu.shape).astype(np.float32)
+            action = np.clip(mu + noise, -1.0, 1.0).astype(np.float32)
+            logp = float(-0.5 * float(np.sum((action - mu) ** 2)) / (0.1 ** 2))
+            return action, logp
+        return mu, 0.0
 
 
 # --------------------------------------------------------------------------- #

@@ -26,6 +26,7 @@ class Trajectory:
     done: bool = False
     success: bool = False
     audio_wav: Optional[np.ndarray] = None   # B3: instruction wav (rollout = update)
+    step_logps: List[float] = field(default_factory=list)  # logp_old per step (GRPO ratio)
 
     @property
     def length(self) -> int:

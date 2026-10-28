@@ -125,15 +125,16 @@ class OpenVLAWrapper(nn.Module):
 
     def forward_sft(self, images: torch.Tensor, lang_texts: List[str],
                     audio_wavs: Optional[List] = None,
-                    actions: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    actions: Optional[torch.Tensor] = None,
+                    temperature: float = 1.0) -> torch.Tensor:
         """Predicted 7-D action in [-1,1].
 
         With `actions` (SFT): teacher-forced native-head logits (B,7,256) -> expected
         action = softmax(logits) @ bin_centers. Without (rollout/eval): autoregressive
-        generation through the native head.
+        generation through the native head (temperature=0 -> greedy/deterministic).
         """
         if actions is None:
-            return self._generate_action(images, lang_texts)
+            return self._generate_action(images, lang_texts, temperature)
 
         inputs = self._prep_inputs(images, lang_texts)
         tok = self._token_ids(actions.to(images.device))
@@ -176,6 +177,36 @@ class OpenVLAWrapper(nn.Module):
         logp = torch.log_softmax(logits, dim=-1)
         q = self._quantize(actions.to(images.device))
         return logp.gather(-1, q.unsqueeze(-1)).squeeze(-1).sum(-1)  # (B,)
+
+    @torch.no_grad()
+    def sample_action(self, images: torch.Tensor, lang_texts: List[str],
+                      temperature: float = 1.0):
+        """Sampled action + its logp under the SAMPLING distribution (temp-scaled),
+        for GRPO rollout (logp_old) and stochastic action selection."""
+        inputs = self._prep_inputs(images, lang_texts)
+        ids = inputs["input_ids"]
+        if ids[0, -1].item() != EMPTY_TOKEN:
+            ids = torch.cat([ids, torch.tensor([[EMPTY_TOKEN]], device=ids.device)], dim=1)
+        gen_kwargs = dict(attention_mask=inputs["attention_mask"], max_new_tokens=7)
+        if temperature > 0:
+            gen_kwargs.update(do_sample=True, temperature=temperature)
+        else:
+            gen_kwargs.update(do_sample=False)
+        gen = self.base.generate(ids, **gen_kwargs)
+        tokens = gen[0, -self.action_dim:]
+        bins = self.vocab_size - tokens.cpu().numpy().astype(np.int64)
+        bins = np.clip(bins - 1, 0, self.num_bins - 1)
+        action = torch.from_numpy(self.bin_centers[bins]).float().unsqueeze(0) \
+            .to(images.device)
+        # logp under the sampling distribution (same temperature as generate)
+        tok2 = tokens.unsqueeze(0)
+        ids2 = torch.cat([inputs["input_ids"], tok2], dim=1)
+        mask2 = torch.cat([inputs["attention_mask"], torch.ones_like(tok2)], dim=1)
+        logits = self._head_logits(inputs, ids2, mask2, self.action_dim)
+        logp = torch.log_softmax(logits / max(temperature, 1e-6), dim=-1)
+        q = torch.from_numpy(bins).long().to(images.device).unsqueeze(0)
+        logp_old = logp.gather(-1, q.unsqueeze(-1)).squeeze(-1).sum(-1).item()
+        return action, logp_old
 
     # ------------------------------------------------------------------ #
     def save_adapter(self, path: str) -> None:
