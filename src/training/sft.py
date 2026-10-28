@@ -119,9 +119,10 @@ class SFTTrainer:
         if smoke_steps:
             train_mse = self.run_epoch(train_loader, logger, train=True,
                                        max_batches=smoke_steps)
+            # ALL ranks run val (no collectives, but keeps ranks in lockstep so
+            # nobody destroys the process group while others still sync)
             val_mse = self.run_epoch(val_loader, logger, train=False,
-                                     max_batches=smoke_steps) if self.is_main \
-                else float("nan")
+                                     max_batches=smoke_steps)
             if self.is_main:
                 logger.log({"sft/smoke_train_mse": train_mse,
                             "sft/smoke_val_mse": val_mse})
@@ -135,8 +136,9 @@ class SFTTrainer:
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
             train_mse = self.run_epoch(train_loader, logger, train=True)
-            val_mse = self.run_epoch(val_loader, logger, train=False) if self.is_main \
-                else float("inf")
+            # ALL ranks run val: keeps ranks in lockstep (main-only val lets
+            # non-main ranks exit/destroy the group while main still syncs)
+            val_mse = self.run_epoch(val_loader, logger, train=False)
             if self.is_main:
                 history["train_mse"].append(train_mse)
                 history["val_mse"].append(val_mse)

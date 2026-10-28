@@ -110,7 +110,10 @@ def main():
         device = f"cuda:{rank}"
         model.to(device)
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[rank], find_unused_parameters=True)
+            model, device_ids=[rank], find_unused_parameters=False)
+        # gradient checkpointing triggers reentrant backward (variables marked
+        # ready twice); the SFT graph is static across iterations -> static graph
+        model._set_static_graph()
         from torch.utils.data import DistributedSampler
         train_loader = DataLoader(
             train_loader.dataset, batch_size=train_loader.batch_size,
@@ -129,6 +132,8 @@ def main():
         logger.finish()
         print(f"SFT done. GRPO starting checkpoint: {best_ckpt}")
     if rank is not None:
+        # let every rank finish all pending collectives before teardown
+        torch.distributed.barrier()
         torch.distributed.destroy_process_group()
 
 
