@@ -42,16 +42,13 @@ def main():
     idx = json.load(open(full_index_path))
     entries, url = idx["entries"], idx["url"]
 
-    # 1. lang annotations (windows + instruction texts)
-    lang_train = data / "meta" / "training" / "lang_annotations" / "auto_lang_ann.npy"
-    lang_val = data / "meta" / "validation" / "lang_annotations" / "auto_lang_ann.npy"
-    for name, dst in [
-        ("task_ABC_D/training/lang_annotations/auto_lang_ann.npy", lang_train),
-        ("task_ABC_D/validation/lang_annotations/auto_lang_ann.npy", lang_val),
-    ]:
-        if not dst.exists():
-            print(f"downloading {name} ...", flush=True)
-            fetch_one(url, name, entries[name], data / "meta")
+    # 1. lang annotations (windows + instruction texts) — original layout nests
+    # them under meta/task_ABC_D/ (downloaded during initial setup)
+    lang_train = data / "meta" / "task_ABC_D" / "training" / "lang_annotations" / "auto_lang_ann.npy"
+    lang_val = data / "meta" / "task_ABC_D" / "validation" / "lang_annotations" / "auto_lang_ann.npy"
+    for p in (lang_train, lang_val):
+        if not p.exists():
+            raise SystemExit(f"missing {p}")
 
     lt = np.load(lang_train, allow_pickle=True).item()
     scene = np.load(data / "meta" / "training" / "scene_info.npy",
