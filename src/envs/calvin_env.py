@@ -142,4 +142,14 @@ class CalvinEnv:
         return np.clip(np.asarray(raw, dtype=np.float32), -1.0, 1.0)
 
     def close(self):
-        self.env.close()
+        # Idempotent + defang the inner env's __del__: pybullet REUSES DIRECT
+        # connection ids, and a delayed GC of an old env runs close() again,
+        # disconnecting the id a NEW env just reconnected with (kills rollouts /
+        # evals with 'Not connected to physics server'). Setting p=None makes the
+        # inner close() skip its disconnect so only OUR explicit close disconnects.
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if getattr(self, "env", None) is not None:
+            self.env.close()
+            self.env.p = None   # inner close() checks `self.p is not None`
