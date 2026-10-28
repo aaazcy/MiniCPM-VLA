@@ -22,11 +22,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / "runs" / "orchestrator_state.json"
 ENV = (
-    "export PATH=/root/miniconda3/bin:$PATH "
-    "export HF_ENDPOINT=https://hf-mirror.com "
-    "export PYOPENGL_PLATFORM=egl "
-    "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-    "export TOKENIZERS_PARALLELISM=false "
+    "export PATH=/root/miniconda3/bin:$PATH && "
+    "export HF_ENDPOINT=https://hf-mirror.com && "
+    "export PYOPENGL_PLATFORM=egl && "
+    "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
+    "export TOKENIZERS_PARALLELISM=false && "
 )
 PY = "/root/miniconda3/bin/python"
 
@@ -125,6 +125,23 @@ def wait_sft_done(group_id: str, logfile: Path) -> None:
         time.sleep(30)
 
 
+def launch_eval_shards(group: str, ckpt: str, prefix: str) -> dict:
+    """Launch a 3-card sharded eval; returns tag -> Popen."""
+    procs = {}
+    for gpu in range(3):
+        log = ROOT / "runs" / f"eval_{prefix}_shard{gpu}.log"
+        procs[f"{prefix}_shard{gpu}"] = launch(
+            eval_cmd(group, ckpt, gpu, gpu, 3), log)
+    return procs
+
+
+def procs_all_failed(procs: dict) -> bool:
+    """True if every launched proc has exited with a non-zero return code."""
+    if not procs:
+        return False
+    return all(p.poll() is not None and p.returncode != 0 for p in procs.values())
+
+
 def main():
     state = load_state()
     state.setdefault("stage", "a1_sft")
@@ -139,17 +156,10 @@ def main():
             if (not pgrep_running("train_sft.py --group a1")
                     and logf.exists() and "SFT done" in logf.read_text()):
                 print("[orch] A1 SFT finished -> evaluate best (3-card shard)", flush=True)
-                procs = {}
-                for gpu in range(3):
-                    log = ROOT / "runs" / f"eval_A1_id_shard{gpu}.log"
-                    procs[f"A1_eval_shard{gpu}"] = launch(
-                        eval_cmd("a1", f"{ROOT}/runs/A1/sft/best", gpu, gpu, 3), log)
-                state["procs"] = {k: None for k in procs}
-                # keep Popen handles in-process only (not serializable)
+                main.procs = launch_eval_shards("a1", f"{ROOT}/runs/A1/sft/best", "A1_id")
                 state["stage"] = "a1_eval"
+                state["eval_retries"] = 0
                 save_state(state)
-                # stash procs in a module-level holder for subsequent polls
-                main.procs = procs
                 continue
             time.sleep(30)
             continue
@@ -163,6 +173,14 @@ def main():
                 continue
             merged = merge_shards(ROOT / "runs" / "A1")
             if merged is None:
+                retries = state.get("eval_retries", 0)
+                if procs_all_failed(procs) and retries < 3:
+                    print(f"[orch] A1 eval failed -> relaunching (retry {retries + 1}/3)",
+                          flush=True)
+                    main.procs = launch_eval_shards("a1", f"{ROOT}/runs/A1/sft/best", "A1_id")
+                    state["eval_retries"] = retries + 1
+                    save_state(state)
+                    continue
                 print("[orch] A1 shards missing; waiting", flush=True)
                 time.sleep(30)
                 continue
@@ -171,6 +189,7 @@ def main():
             log = ROOT / "runs" / "train_b2_sft_ddp4.log"
             main.b2_proc = launch(sft_cmd("b2", 4), log)
             state["stage"] = "b2_sft"
+            state.pop("eval_retries", None)
             save_state(state)
             continue
 
@@ -183,13 +202,9 @@ def main():
             logf = ROOT / "runs" / "train_b2_sft_ddp4.log"
             if logf.exists() and "SFT done" in logf.read_text():
                 print("[orch] B2 SFT finished -> evaluate best (3-card shard)", flush=True)
-                procs = {}
-                for gpu in range(3):
-                    log = ROOT / "runs" / f"eval_B2_id_shard{gpu}.log"
-                    procs[f"B2_eval_shard{gpu}"] = launch(
-                        eval_cmd("b2", f"{ROOT}/runs/B2/sft/best", gpu, gpu, 3), log)
-                main.procs = procs
+                main.procs = launch_eval_shards("b2", f"{ROOT}/runs/B2/sft/best", "B2_id")
                 state["stage"] = "b2_eval"
+                state["eval_retries"] = 0
                 save_state(state)
                 continue
             time.sleep(30)
@@ -204,6 +219,14 @@ def main():
                 continue
             merged = merge_shards(ROOT / "runs" / "B2")
             if merged is None:
+                retries = state.get("eval_retries", 0)
+                if procs_all_failed(procs) and retries < 3:
+                    print(f"[orch] B2 eval failed -> relaunching (retry {retries + 1}/3)",
+                          flush=True)
+                    main.procs = launch_eval_shards("b2", f"{ROOT}/runs/B2/sft/best", "B2_id")
+                    state["eval_retries"] = retries + 1
+                    save_state(state)
+                    continue
                 print("[orch] B2 shards missing; waiting", flush=True)
                 time.sleep(30)
                 continue
@@ -212,6 +235,7 @@ def main():
             log = ROOT / "runs" / "train_b2_grpo_dist.log"
             main.b2_grpo_proc = launch(grpo_cmd("b2"), log)
             state["stage"] = "b2_grpo"
+            state.pop("eval_retries", None)
             save_state(state)
             continue
 
