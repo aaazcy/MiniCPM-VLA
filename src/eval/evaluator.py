@@ -122,12 +122,14 @@ class Evaluator:
 
     def evaluate_subset(self, instructions: List[str], seeds: int,
                         temperature: float, scenes: List[str] = None,
-                        init_states: List = None, tasks: List = None) -> Dict:
+                        init_states: List = None, tasks: List = None,
+                        return_per_instruction: bool = False):
         instructions = instructions[: self.cfg.eval.max_episodes]
         if tasks is not None:
             tasks = tasks[: self.cfg.eval.max_episodes]
         aggr = {"success_rate": [], "mean_return": [], "mean_steps": [],
                 "action_smoothness": [], "mean_ee_error": []}
+        per_instr: List[Dict] = []
         for i, instr in enumerate(instructions):
             scene = scenes[i] if scenes else "calvin_scene_A"
             rs, ss = None, None
@@ -141,7 +143,10 @@ class Evaluator:
                 v = m[k]
                 if v is not None:
                     aggr[k].append(v)
-        return {k: float(np.mean(v)) for k, v in aggr.items() if v}
+            if return_per_instruction:
+                per_instr.append({"instruction": instr, "task": task, "metrics": m})
+        agg = {k: float(np.mean(v)) for k, v in aggr.items() if v}
+        return (agg, per_instr) if return_per_instruction else agg
 
     # ------------------------------------------------------------------ #
     def run_full(self, id_instructions: List[str], ood_instructions: List[str],

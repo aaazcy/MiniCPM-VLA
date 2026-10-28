@@ -166,10 +166,11 @@ def main():
         logger.finish()
         return
 
-    metrics = evaluator.evaluate_subset(instrs, cfg.eval.seeds, cfg.eval.temperature,
-                                        scenes=scenes, init_states=init_states, tasks=tasks)
+    metrics, per_instr = evaluator.evaluate_subset(
+        instrs, cfg.eval.seeds, cfg.eval.temperature,
+        scenes=scenes, init_states=init_states, tasks=tasks,
+        return_per_instruction=True)
     logger.log({f"eval/{args.split}/{k}": v for k, v in metrics.items()}, commit=True)
-    out = cfg.run_dir / f"eval_{args.split}_{args.modality}.json"
     shard_tag = f"_shard{args.shard[0]}of{args.shard[1]}" if args.shard else ""
     out = cfg.run_dir / f"eval_{args.split}_{args.modality}{shard_tag}.json"
     with open(out, "w") as f:
@@ -177,6 +178,13 @@ def main():
                    "modality": args.modality, "shard": args.shard,
                    "ckpt": str(ckpt), "n_instructions": len(instrs),
                    "metrics": metrics}, f, indent=2)
+    # per-instruction breakdown (task + instruction + per-seed metrics) for
+    # per-task success-rate analysis
+    per_out = cfg.run_dir / f"eval_{args.split}_{args.modality}{shard_tag}_per_instr.json"
+    with open(per_out, "w") as f:
+        json.dump({"group": cfg.group.id, "split": args.split,
+                   "modality": args.modality, "shard": args.shard,
+                   "ckpt": str(ckpt), "per_instruction": per_instr}, f, indent=2)
     print(f"[{cfg.group.id}/{args.split}/{args.modality}] "
           f"{json.dumps(metrics, indent=2)}\nSaved to {out}")
     logger.finish()
