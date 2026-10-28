@@ -207,9 +207,15 @@ class OpenVLAWrapper(nn.Module):
         """Autoregressive action generation (batch 1); bin decode, no unnormalization."""
         inputs = self._prep_inputs(images, lang_texts)
         ids = inputs["input_ids"]
+        mask = inputs["attention_mask"]
         if ids[0, -1].item() != EMPTY_TOKEN:
             ids = torch.cat([ids, torch.tensor([[EMPTY_TOKEN]], device=ids.device)], dim=1)
-        gen_kwargs = dict(attention_mask=inputs["attention_mask"], max_new_tokens=7)
+            # keep the attention mask aligned with the appended EMPTY_TOKEN, otherwise
+            # generate() attends over T+1 tokens with a length-T mask and emits a
+            # constant/garbage action (this was the action-collapse root cause)
+            mask = torch.cat([mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype,
+                                               device=mask.device)], dim=1)
+        gen_kwargs = dict(attention_mask=mask, max_new_tokens=7)
         if temperature > 0:
             gen_kwargs.update(do_sample=True, temperature=temperature)
         else:
@@ -239,9 +245,14 @@ class OpenVLAWrapper(nn.Module):
         for GRPO rollout (logp_old) and stochastic action selection."""
         inputs = self._prep_inputs(images, lang_texts)
         ids = inputs["input_ids"]
+        mask = inputs["attention_mask"]
         if ids[0, -1].item() != EMPTY_TOKEN:
             ids = torch.cat([ids, torch.tensor([[EMPTY_TOKEN]], device=ids.device)], dim=1)
-        gen_kwargs = dict(attention_mask=inputs["attention_mask"], max_new_tokens=7)
+            # keep the attention mask aligned with the appended EMPTY_TOKEN (see
+            # _generate_action; a length-T mask over T+1 tokens collapses the action)
+            mask = torch.cat([mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype,
+                                               device=mask.device)], dim=1)
+        gen_kwargs = dict(attention_mask=mask, max_new_tokens=7)
         if temperature > 0:
             gen_kwargs.update(do_sample=True, temperature=temperature)
         else:
