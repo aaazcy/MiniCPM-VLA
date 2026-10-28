@@ -31,15 +31,16 @@ dataset:
   filter_stalled_gripper: true
 
 sft:
-  loss: mse                   # MSE(pred_action, demo_action)
+  loss: mse                   # MSE(pred_action, demo_action); B discrete head uses CE on bins
   optimizer: adamw
   lr_action_head: 1.0e-4
   lr_lora: 2.0e-5
-  batch_size: 2               # trajectories per batch (see steps_per_traj)
-  steps_per_traj: 2           # steps sampled per trajectory -> effective step batch = 4
+  batch_size: 1               # trajectories (train) / chunks (val) per batch
+  steps_per_traj: 4           # random chunk length sampled per trajectory per epoch
+  val_chunk_size: 8           # val is pre-chunked to this size for full-frame coverage
   weight_decay: 1.0e-4
   gradient_checkpointing: true
-  max_epochs: 2               # few-demo LoRA converges fast (measured: MSE ~0.04 by step 250)
+  max_epochs: 6               # CALVIN-only; early stopping on SFT-val MSE
   early_stop_patience: 1      # stop 1 epoch after the SFT-val MSE stops improving
   bf16: true
 
@@ -67,6 +68,8 @@ reward:                       # FIXED for all groups
 
 model:
   action_head:
+    type: discrete            # discrete (256 bins, matches OpenVLA) | continuous (legacy MLP)
+    num_bins: 256
     hidden_dim: 4096          # last-token hidden size (Llama2-7B & Qwen3-8B both 4096)
     dims: [512, 256]
     action_dim: 7
@@ -82,7 +85,7 @@ rollout:
 eval:
   temperature: 0.0            # deterministic
   seeds: 10                   # repeats per test episode (was 20; 10 x 20 windows is enough)
-  max_episodes: 20            # cap episodes per split (speed: eval ~15 min/split)
+  max_episodes: 34            # all id_test windows
   id_test: calvin_A_val       # official held-out val split of calvin_A (never trained on)
   ood_test: calvin_D
   robustness: true            # paraphrased / reordered / long instructions

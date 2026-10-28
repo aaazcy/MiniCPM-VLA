@@ -12,4 +12,4 @@ group:
     freeze_llm: false
   sft_only: false
   audio: false
-  dataset: [calvin, bridge]
+  dataset: [calvin]

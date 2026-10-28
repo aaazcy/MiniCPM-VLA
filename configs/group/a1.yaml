@@ -11,6 +11,6 @@ group:
     freeze_llm: false
   sft_only: false
   audio: false
-  dataset: [calvin, bridge]
+  dataset: [calvin]
 
   rollout_engine_override: hf   # no vLLM on 32GB cards (colocation OOM); HF engine for all groups

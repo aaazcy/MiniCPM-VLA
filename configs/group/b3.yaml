@@ -21,10 +21,9 @@ group:
   is_ablation: true               # excluded from head-to-head comparison vs A
   rollout_engine_override: hf     # stock vLLM lacks MiniCPM-o audio path
 
-# B3 carries the audio tower + audio tokens on top of the 9B LLM: at the global
-# batch (2 traj x 2 steps = 4 samples/forward) SFT peaks at ~32.3G of 31.6G.
-# Shrink the effective step batch to 1 sample/forward for VRAM margin
-# (B3's CSI set is tiny, ~91 windows, so throughput impact is negligible).
+# B3 carries the audio tower + audio tokens on top of the 9B LLM: keep the effective
+# step batch small (1 traj x 4 steps = 4 samples/forward) for VRAM margin. The CSI
+# train set is CALVIN-only (~416 windows), same data distribution as B2.
 sft:
   batch_size: 1
-  steps_per_traj: 1
+  steps_per_traj: 4
