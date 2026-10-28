@@ -89,3 +89,14 @@
     untoggled (0 transitions), identical to the plain `reset(robot_obs, scene_obs)` path
     (`scripts/diag_reset_ab.py`). The paper's 100% is therefore attributable to task/scene
     robustness (scene D), not to a reset source or mechanism we lack.
+
+16. **Action-head confound: A is autoregressive, B is single-pass discrete.** A (OpenVLA)
+    decodes actions as 7 autoregressive vocabulary tokens (native lm_head); B (MiniCPM-o)
+    decodes them as a 7×256 categorical from a single forward pass (custom
+    `DiscreteActionHead`). So "A vs B" mixes two differences at once — the backbone
+    (native VLA vs Omni) *and* the action decoder (autoregressive vs non-autoregressive).
+    This is a deliberate, disclosed design choice, but it means a pure "VLA-vs-Omni"
+    attribution is not possible without a third arm sharing one head design. See
+    `docs/action_head_design.md` for the full rationale (why B is non-autoregressive,
+    the MLP-vs-AR-vs-flow-matching research landscape, and what a principled upgrade
+    would be).
