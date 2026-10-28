@@ -36,6 +36,8 @@ def build_model(cfg: Config, stage: str = "sft",
             enable_audio=cfg.group.audio,
             audio_sample_rate=cfg.group.audio_sample_rate,
             audio_only=cfg.group.audio_only,
+            action_head_type=cfg.model.action_head.type,
+            num_bins=cfg.model.action_head.num_bins,
             **kwargs,
         )
     else:

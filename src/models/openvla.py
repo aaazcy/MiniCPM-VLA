@@ -21,6 +21,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from peft import LoraConfig, get_peft_model
 
@@ -146,6 +147,13 @@ class OpenVLAWrapper(nn.Module):
             .to(logits.device)
         return (probs * centers).sum(-1)  # (B,7)
 
+    def sft_loss(self, images: torch.Tensor, lang_texts: List[str],
+                 audio_wavs: Optional[List], actions: torch.Tensor):
+        """OpenVLA SFT objective: MSE on the expected action (native bins)."""
+        pred = self.forward_sft(images, lang_texts, audio_wavs, actions)
+        loss = F.mse_loss(pred, actions.to(pred.device))
+        return {"loss": loss, "mse": loss.detach()}
+
     @torch.no_grad()
     def _generate_action(self, images: torch.Tensor, lang_texts: List[str],
                          temperature: float = 1.0) -> torch.Tensor:
@@ -180,7 +188,7 @@ class OpenVLAWrapper(nn.Module):
 
     @torch.no_grad()
     def sample_action(self, images: torch.Tensor, lang_texts: List[str],
-                      temperature: float = 1.0):
+                      temperature: float = 1.0, audio_wavs: Optional[List] = None):
         """Sampled action + its logp under the SAMPLING distribution (temp-scaled),
         for GRPO rollout (logp_old) and stochastic action selection."""
         inputs = self._prep_inputs(images, lang_texts)

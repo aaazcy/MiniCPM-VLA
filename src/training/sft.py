@@ -85,9 +85,16 @@ class SFTTrainer:
             with torch.autocast(device_type="cuda" if self.device.startswith("cuda") else "cpu",
                                 dtype=torch.bfloat16, enabled=self.cfg.sft.bf16):
                 audio = batch.get("audio_wavs")
-                # call the module itself (not .forward_sft) so DDP's sync hooks run
-                pred = self.model(px, batch["langs"], audio, act)
-                loss = self.loss_fn(pred, act)
+                if hasattr(self.raw, "sft_loss") and not isinstance(
+                        self.model, torch.nn.parallel.DistributedDataParallel):
+                    out = self.raw.sft_loss(px, batch["langs"], audio, act)
+                    loss = out["loss"]
+                    mse = float(out["mse"]) if "mse" in out else float(loss.detach())
+                else:
+                    # call the module itself (not .forward_sft) so DDP's sync hooks run
+                    pred = self.model(px, batch["langs"], audio, act)
+                    loss = self.loss_fn(pred, act)
+                    mse = float(loss.detach())
 
             if train:
                 self.opt.zero_grad(set_to_none=True)
@@ -95,9 +102,9 @@ class SFTTrainer:
                 torch.nn.utils.clip_grad_norm_(self.raw.trainable_parameters(), 1.0)
                 self.opt.step()
                 if self.is_main and self.global_step % self.cfg.wandb.log_every_steps == 0:
-                    logger.log({"sft/train_mse": loss.item(), "sft/step": self.global_step},
-                               step=self.global_step)
-            total_mse += loss.item() * len(act)
+                    logger.log({"sft/train_mse": mse, "sft/train_loss": float(loss),
+                                "sft/step": self.global_step}, step=self.global_step)
+            total_mse += mse * len(act)
             n += len(act)
             self.global_step += 1
         return total_mse / max(n, 1)

@@ -67,6 +67,7 @@ class SftCfg(BaseModel):
     lr_lora: float = 2.0e-5
     batch_size: int = 2
     steps_per_traj: int = 2
+    val_chunk_size: int = 8       # steps per val item (val uses full-coverage chunks)
     weight_decay: float = 1.0e-4
     gradient_checkpointing: bool = True
     max_epochs: int = 20
@@ -99,6 +100,8 @@ class RewardCfg(BaseModel):
 
 
 class ActionHeadCfg(BaseModel):
+    type: Literal["discrete", "continuous"] = "discrete"
+    num_bins: int = 256
     hidden_dim: int = 4096
     dims: List[int] = [512, 256]
     action_dim: int = 7
@@ -120,7 +123,7 @@ class RolloutCfg(BaseModel):
 class EvalCfg(BaseModel):
     temperature: float = 0.0
     seeds: int = 10
-    max_episodes: int = 20
+    max_episodes: int = 34
     id_test: str = "calvin_A_val"
     ood_test: str = "calvin_D"
     robustness: bool = True

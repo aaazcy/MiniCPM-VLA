@@ -25,11 +25,12 @@ import logging
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch import nn
 from peft import LoraConfig, get_peft_model
 
-from .action_head import ActionHead
+from .action_head import ActionHead, DiscreteActionHead
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class MiniCPMoWrapper(nn.Module):
                  lora_alpha: int = 16, lora_dropout: float = 0.0,
                  enable_audio: bool = False, audio_sample_rate: int = 16000,
                  audio_only: bool = False,
+                 action_head_type: str = "discrete", num_bins: int = 256,
                  hf_cache_dir: Optional[str] = None,
                  dtype: torch.dtype = torch.bfloat16):
         super().__init__()
@@ -82,8 +84,15 @@ class MiniCPMoWrapper(nn.Module):
             qwen_clm.embed_tokens = qwen_clm.model.embed_tokens
             log.info("MiniCPM-o: LoRA on LLM (r=%d, alpha=%d)", lora_r, lora_alpha)
 
-        # new shared action head (spec-exact): Linear(4096,512)->LN->GELU->...->Tanh
-        self.action_head = ActionHead(hidden_dim=4096, dims=(512, 256), action_dim=7)
+        # new action head (discrete by default, matching OpenVLA's bin parameterization)
+        self.action_head_type = action_head_type
+        if action_head_type == "discrete":
+            self.action_head = DiscreteActionHead(hidden_dim=self.hidden_dim,
+                                                  dims=(512, 256), action_dim=7,
+                                                  num_bins=num_bins)
+        else:
+            self.action_head = ActionHead(hidden_dim=self.hidden_dim, dims=(512, 256),
+                                          action_dim=7)
 
     # ------------------------------------------------------------------ #
     def prepare_for_sft(self) -> None:
@@ -237,14 +246,65 @@ class MiniCPMoWrapper(nn.Module):
                     audio_wavs: Optional[List] = None,
                     actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         inputs = self._prepare_inputs(images, lang_texts, audio_wavs)
-        return self.action_head(self._last_token_hidden(inputs))
+        h = self._last_token_hidden(inputs)
+        if self.action_head_type == "discrete":
+            logits = self.action_head(h)
+            if actions is None:
+                return self.action_head.decode(logits, temperature=0.0)
+            return self.action_head.expected_action(logits)
+        return self.action_head(h)
+
+    def sft_loss(self, images: torch.Tensor, lang_texts: List[str],
+                 audio_wavs: Optional[List], actions: torch.Tensor):
+        """SFT objective -> {'loss': optimization target, 'mse': action MSE}.
+
+        discrete: cross-entropy on quantized bins (loss) + expected-action MSE (metric).
+        continuous: MSE (loss == mse)."""
+        inputs = self._prepare_inputs(images, lang_texts, audio_wavs)
+        h = self._last_token_hidden(inputs)
+        actions = actions.to(h.device).float()
+        if self.action_head_type == "discrete":
+            logits = self.action_head(h)
+            q = self.action_head.quantize(actions)
+            loss = F.cross_entropy(logits.reshape(-1, self.action_head.num_bins),
+                                   q.reshape(-1))
+            mse = F.mse_loss(self.action_head.expected_action(logits), actions)
+            return {"loss": loss, "mse": mse.detach()}
+        pred = self.action_head(h)
+        loss = F.mse_loss(pred, actions)
+        return {"loss": loss, "mse": loss.detach()}
+
+    @torch.no_grad()
+    def sample_action(self, images: torch.Tensor, lang_texts: List[str],
+                      temperature: float = 1.0,
+                      audio_wavs: Optional[List] = None):
+        """Sample an action + its logp under the sampling distribution (rollout)."""
+        inputs = self._prepare_inputs(images, lang_texts, audio_wavs)
+        h = self._last_token_hidden(inputs)
+        if self.action_head_type == "discrete":
+            logits = self.action_head(h)
+            return self.action_head.sample(logits, temperature)
+        mu = self.action_head(h)
+        if temperature > 0:
+            noise = torch.randn_like(mu) * (0.1 * temperature)
+            action = (mu + noise).clamp(-1, 1)
+            logp = -0.5 * ((action - mu) ** 2).sum(-1) / (0.1 ** 2)
+        else:
+            action, logp = mu, torch.zeros(mu.shape[0], device=mu.device)
+        return action, logp
 
     def logp_actions(self, images: torch.Tensor, lang_texts: List[str],
                      actions: torch.Tensor,
                      audio_wavs: Optional[List] = None) -> torch.Tensor:
-        """Gaussian log-likelihood of the continuous actions under the action head.
-        sigma = 0.1 matches the rollout exploration noise (GRPO importance ratios)."""
-        mu = self.forward_sft(images, lang_texts, audio_wavs)
+        """Log-likelihood of the actions under the action head (GRPO ratio).
+
+        discrete: categorical logp over bins; continuous: Gaussian (sigma=0.1)."""
+        inputs = self._prepare_inputs(images, lang_texts, audio_wavs)
+        h = self._last_token_hidden(inputs)
+        if self.action_head_type == "discrete":
+            logits = self.action_head(h)
+            return self.action_head.logp(logits, actions)
+        mu = self.action_head(h)
         var = 0.1 ** 2
         return -0.5 * ((actions - mu) ** 2).sum(-1) / var \
             - 0.5 * 7 * torch.log(torch.tensor(6.2832 * var, device=mu.device,
