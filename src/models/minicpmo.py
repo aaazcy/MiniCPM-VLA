@@ -139,6 +139,13 @@ class MiniCPMoWrapper(nn.Module):
             if audios is not None:
                 texts = [f"(<audio>./</audio>)\n{t}" for t in texts]
 
+        # Wrap in MiniCPM-o's official chat template (matches model.chat / the model's
+        # pretraining format): "<|im_start|>user\n{content}<|im_end|>\n
+        # <|im_start|>assistant\n". Without it the model sees raw placeholders +
+        # instruction and runs in a non-official prompt regime (analogous to OpenVLA's
+        # missing "In: ... Out:" wrapper).
+        texts = [f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n" for t in texts]
+
         # The image processor treats a LIST of images as TILES of ONE sample, so
         # batching must be done per-sample and merged manually.
         per = []

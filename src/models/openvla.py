@@ -140,7 +140,12 @@ class OpenVLAWrapper(nn.Module):
         if imgs[0].max() <= 1.5:
             imgs = [(im * 255).astype("uint8") for im in imgs]
         imgs = [Image.fromarray(im.transpose(1, 2, 0)) for im in imgs]
-        inputs = self.processor(text=list(lang_texts), images=imgs,
+        # OpenVLA's official prompt format (matches the vLLM / predict_action path):
+        #   "In: {instruction}\nOut:"
+        # The image patches are injected by the model's forward after <BOS> (there is
+        # no image placeholder token), so only the text needs the In:/Out: wrapper.
+        prompts = [f"In: {t}\nOut:" for t in lang_texts]
+        inputs = self.processor(text=prompts, images=imgs,
                                 padding=True, truncation=True, max_length=64,
                                 return_tensors="pt").to(images.device)
         inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
