@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,18 @@ def main():
         json.dump({"group": cfg.group.id, "split": args.split,
                    "modality": args.modality, "shard": args.shard,
                    "ckpt": str(ckpt), "per_instruction": per_instr}, f, indent=2)
+    # print per-instruction success to the log (visible even without the JSON)
+    for d in per_instr:
+        print(f"  [per-instr] sr={d['metrics']['success_rate']:.2f} "
+              f"task={d['task'] or '(none)'} | {d['instruction']}")
+    # append to the central results ledger (append-only, never overwritten)
+    ledger = Path(cfg.experiment.output_dir) / "results.jsonl"
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"),
+             "group": cfg.group.id, "split": args.split, "modality": args.modality,
+             "shard": args.shard, "ckpt": str(ckpt),
+             "metrics": metrics, "per_instruction": per_instr}
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
     print(f"[{cfg.group.id}/{args.split}/{args.modality}] "
           f"{json.dumps(metrics, indent=2)}\nSaved to {out}")
     logger.finish()

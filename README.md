@@ -194,6 +194,16 @@ CALVIN's raw env reports only `{robot_info, scene_info}` — no success signal. 
 - Episodes reset to their **recorded start state** (`init_robot_obs`/`init_scene_obs`).
 - `--shard K N` slices the episode list `instructions[K::N]` so one eval can be spread across N GPUs; merge shards by weighting each metric by `n_instructions`.
 
+### Results ledger
+
+Every eval appends to `runs/results.jsonl` (append-only, never overwritten): aggregate metrics **plus** the per-instruction breakdown (`task`, `instruction`, per-seed metrics). `scripts/report_results.py` reads the ledger and prints a per-group aggregate table and a per-task success-rate table:
+
+```bash
+python scripts/report_results.py                 # id/native
+python scripts/report_results.py --split ood
+python scripts/report_results.py --modality audio
+```
+
 ---
 
 ## Quick Start

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +82,7 @@ def grpo_cmd(group: str) -> str:
 def merge_shards(run_dir: Path, split: str = "id", modality: str = "native",
                  n_shards: int = 3):
     acc, wsum, total = {}, {}, 0
+    per_instr = []
     for k in range(n_shards):
         f = run_dir / f"eval_{split}_{modality}_shard{k}of{n_shards}.json"
         if not f.exists():
@@ -93,10 +95,23 @@ def merge_shards(run_dir: Path, split: str = "id", modality: str = "native",
                 continue
             acc[key] = acc.get(key, 0.0) + val * n
             wsum[key] = wsum.get(key, 0.0) + n
+        # collect per-instruction detail from the shard's *_per_instr.json
+        pf = run_dir / f"eval_{split}_{modality}_shard{k}of{n_shards}_per_instr.json"
+        if pf.exists():
+            per_instr.extend(json.loads(pf.read_text()).get("per_instruction", []))
     merged = {k: acc[k] / wsum[k] for k in acc}
     merged["n_instructions"] = total
     out = run_dir / f"eval_{split}_{modality}_merged.json"
     out.write_text(json.dumps({"merged": merged}, indent=2))
+    # append the merged result to the central ledger (append-only)
+    group_id = run_dir.name
+    ledger = ROOT / "runs" / "results.jsonl"
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"),
+             "group": group_id, "split": split, "modality": modality,
+             "shard": None, "merged": True, "ckpt": None,
+             "metrics": merged, "per_instruction": per_instr}
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
     return merged
 
 
